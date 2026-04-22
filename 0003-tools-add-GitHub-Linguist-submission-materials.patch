@@ -1,0 +1,292 @@
+From 3acfeea64fcef7d0710b14dc3a3696eab4d45875 Mon Sep 17 00:00:00 2001
+From: Enrique Parodi Spalazzi <enrique.parodi@airbus.com>
+Date: Thu, 23 Apr 2026 00:14:11 +0200
+Subject: [PATCH 3/4] tools: add GitHub Linguist submission materials
+
+Add resources/syntax_highlighting/stl/github_linguist/ with the four
+snippets needed to register Sen STL in github-linguist/linguist
+(languages.yml, grammars.yml, heuristics.yml entries) plus a submission
+guide and sample-selection guidance.
+
+The heuristic disambiguates between Sen STL and the existing
+stereolithography STL registration by looking for a package declaration
+or any STL declaration keyword near the top of the file.
+
+Link the new subdirectory from the top-level syntax_highlighting README.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ resources/syntax_highlighting/stl/README.md   |   1 +
+ .../stl/github_linguist/README.md             | 116 ++++++++++++++++++
+ .../stl/github_linguist/grammars-entry.yml    |  14 +++
+ .../stl/github_linguist/heuristics-entry.yml  |  30 +++++
+ .../stl/github_linguist/languages-entry.yml   |  15 +++
+ .../stl/github_linguist/sample-selection.md   |  41 +++++++
+ 6 files changed, 217 insertions(+)
+ create mode 100644 resources/syntax_highlighting/stl/github_linguist/README.md
+ create mode 100644 resources/syntax_highlighting/stl/github_linguist/grammars-entry.yml
+ create mode 100644 resources/syntax_highlighting/stl/github_linguist/heuristics-entry.yml
+ create mode 100644 resources/syntax_highlighting/stl/github_linguist/languages-entry.yml
+ create mode 100644 resources/syntax_highlighting/stl/github_linguist/sample-selection.md
+
+diff --git a/resources/syntax_highlighting/stl/README.md b/resources/syntax_highlighting/stl/README.md
+index de9ad06..04f26e9 100644
+--- a/resources/syntax_highlighting/stl/README.md
++++ b/resources/syntax_highlighting/stl/README.md
+@@ -11,6 +11,7 @@ most:
+ | **Vim / Neovim**       | [`vim/`](vim/)           | `syntax/`, `ftdetect/`, `ftplugin/`, `indent/` scripts.                                             |
+ | **Emacs**              | [`emacs/`](emacs/)       | `stl-mode.el` major mode with font-lock and 2-space indent.                                         |
+ | **Notepad++**          | [`notepad++/`](notepad++/) | UDL XML importable through *Language → User Defined Language → Define your language...*         |
++| **GitHub (via Linguist)** | [`github_linguist/`](github_linguist/) | Pre-built YAML snippets + submission guide for getting `.stl` files highlighted on github.com. |
+ 
+ Each subdirectory has its own `README.md` with editor-specific install
+ instructions.
+diff --git a/resources/syntax_highlighting/stl/github_linguist/README.md b/resources/syntax_highlighting/stl/github_linguist/README.md
+new file mode 100644
+index 0000000..26507c9
+--- /dev/null
++++ b/resources/syntax_highlighting/stl/github_linguist/README.md
+@@ -0,0 +1,116 @@
++# Getting Sen STL recognised by GitHub Linguist
++
++Once Linguist knows about Sen STL, GitHub will syntax-highlight `.stl` files
++when people browse the Sen repository (and any other repo containing them)
++on github.com. It also makes STL show up in per-repo language statistics.
++
++The process has two sides:
++
++1. **Publish the TextMate grammar to a standalone public GitHub repo** so
++   Linguist can reference it as a git submodule.
++2. **Open a PR against `github-linguist/linguist`** with four edits:
++   `languages.yml`, `grammars.yml`, `heuristics.yml`, and `samples/Sen STL/`.
++
++## Pre-flight: .stl conflicts with stereolithography
++
++The extension `.stl` is already registered in Linguist for
++stereolithography (3D-printing) files. Without a disambiguation
++heuristic, Linguist maintainers will (rightly) reject the PR.
++
++The `heuristics-entry.yml` file in this directory provides a heuristic
++that distinguishes the two based on file content:
++- **Sen STL** files have a `package ...;` declaration or an STL keyword
++  (`class`, `struct`, `enum`, `variant`, `interface`, `sequence`,
++  `array`, `optional`, `quantity`, `alias`) near the top.
++- **Stereolithography ASCII** starts with `solid <name>` on line 1.
++
++## Step-by-step
++
++### 1. Publish the grammar
++
++Create a new public repo, for example `https://github.com/<org>/sen-stl-textmate`,
++whose contents mirror the
++`resources/syntax_highlighting/stl/vscode/` directory of the Sen repo. The
++minimum required layout is:
++
++```
++sen-stl-textmate/
++├── LICENSE
++├── README.md
++├── package.json
++└── syntaxes/
++    └── stl.tmLanguage.json
++```
++
++Tag a release (e.g. `v0.1.0`) so Linguist's submodule has a stable commit
++to pin.
++
++> Why a separate repo? Linguist vendors every grammar as a git submodule
++> under `vendor/grammars/`. Pointing at a separate repo is the normal
++> pattern and keeps Linguist from pulling the entire Sen tree.
++
++### 2. Fork `github-linguist/linguist` and make four edits
++
++Clone your Linguist fork, then:
++
++#### 2a. `lib/linguist/languages.yml`
++
++Add the entry from [`languages-entry.yml`](languages-entry.yml) alphabetically.
++Leave `language_id` as the placeholder; a Linguist maintainer will assign a
++real number during review.
++
++#### 2b. `vendor/grammars.yml` and the submodule
++
++Add the submodule and the entry from [`grammars-entry.yml`](grammars-entry.yml):
++
++```bash
++git submodule add https://github.com/<org>/sen-stl-textmate \
++                  vendor/grammars/sen-stl-textmate
++# then paste the grammars-entry.yml snippet into vendor/grammars.yml,
++# keeping the file sorted.
++```
++
++#### 2c. `lib/linguist/heuristics.yml`
++
++Extend the existing `.stl` disambiguation block with the rules from
++[`heuristics-entry.yml`](heuristics-entry.yml). Do **not** add a second
++`- extensions: ['.stl']` block - merge into the existing one.
++
++#### 2d. `samples/Sen STL/`
++
++Copy 3-5 representative `.stl` files from the Sen repo. See
++[`sample-selection.md`](sample-selection.md) for guidance.
++
++### 3. Verify locally
++
++```bash
++bundle install
++bundle exec rake samples   # rebuild the classifier index
++bundle exec rake test      # run Linguist's test suite
++```
++
++All tests should pass, and `script/licensed` (if prompted) should accept
++the new submodule's LICENSE (Apache-2.0 in our case).
++
++### 4. Open the PR
++
++Commit each change logically (one commit per file is fine) and open the PR
++against `github-linguist/linguist:main`. Include in the PR body:
++
++- A short description of Sen STL (a few sentences) plus a link to
++  [`docs/users_guide/stl.md`](../../../../docs/users_guide/stl.md) or
++  [`docs/users_guide/stl_grammar.md`](../../../../docs/users_guide/stl_grammar.md).
++- A link to the standalone grammar repo.
++- A note that the PR resolves the `.stl` / stereolithography conflict with a
++  heuristic, and that all five samples classify correctly.
++
++## Keeping the grammar in sync
++
++When the Sen-side grammar changes under `resources/syntax_highlighting/stl/vscode/`:
++
++1. Mirror the diff to the standalone grammar repo and tag a release.
++2. In a new PR against Linguist, bump the submodule pointer to the new tag.
++3. Re-run `bundle exec rake test`.
++
++No Linguist PR is needed for grammar fixes that don't change the language's
++public surface (keywords, operators, file extension).
+diff --git a/resources/syntax_highlighting/stl/github_linguist/grammars-entry.yml b/resources/syntax_highlighting/stl/github_linguist/grammars-entry.yml
+new file mode 100644
+index 0000000..94ed565
+--- /dev/null
++++ b/resources/syntax_highlighting/stl/github_linguist/grammars-entry.yml
+@@ -0,0 +1,14 @@
++# Snippet to add to vendor/grammars.yml in a fork of
++# https://github.com/github-linguist/linguist.
++#
++# The path matches the submodule added under vendor/grammars/. Before
++# opening the Linguist PR, publish the TextMate grammar somewhere with
++# a stable public URL (typically as a standalone repo mirroring the
++# resources/syntax_highlighting/stl/vscode/ folder from the Sen repo)
++# and add it as a git submodule:
++#
++#   git submodule add https://github.com/<org>/sen-stl-textmate \
++#                     vendor/grammars/sen-stl-textmate
++
++vendor/grammars/sen-stl-textmate:
++  - source.stl
+diff --git a/resources/syntax_highlighting/stl/github_linguist/heuristics-entry.yml b/resources/syntax_highlighting/stl/github_linguist/heuristics-entry.yml
+new file mode 100644
+index 0000000..29207ce
+--- /dev/null
++++ b/resources/syntax_highlighting/stl/github_linguist/heuristics-entry.yml
+@@ -0,0 +1,30 @@
++# Snippet to add to lib/linguist/heuristics.yml in a fork of
++# https://github.com/github-linguist/linguist.
++#
++# The `.stl` extension is already registered in Linguist for the
++# stereolithography / 3D-printing file format. A heuristic is required so
++# Linguist can decide which language a given `.stl` file belongs to.
++#
++# Distinguishing signals:
++#   - Sen STL always has a `package <name>;` declaration near the top,
++#     and/or one of the STL declaration keywords (class, struct, enum,
++#     variant, interface, sequence, array, optional, quantity, alias).
++#   - Stereolithography ASCII starts with `solid <name>` on line 1.
++#   - Stereolithography binary has an 80-byte header that cannot match
++#     the STL keywords reliably, but the heuristic below sticks to
++#     textual signals, which is enough in practice.
++#
++# The existing 3D-printing entry in heuristics.yml (if any) will need
++# to coexist with the block below. In current Linguist there is a
++# disambiguation for `.stl` listing only STL (stereolithography).
++# Extend that block rather than adding a second one.
++
++disambiguations:
++  - extensions: ['.stl']
++    rules:
++      - language: Sen STL
++        pattern: '(?m)^\s*package\s+[A-Za-z_][A-Za-z0-9_.]*\s*;'
++      - language: Sen STL
++        pattern: '(?m)^\s*(class|struct|enum|variant|interface|sequence|array|optional|quantity|alias)\s+[A-Za-z_]'
++      - language: STL
++        pattern: '\A\s*solid\b'
+diff --git a/resources/syntax_highlighting/stl/github_linguist/languages-entry.yml b/resources/syntax_highlighting/stl/github_linguist/languages-entry.yml
+new file mode 100644
+index 0000000..813c0fa
+--- /dev/null
++++ b/resources/syntax_highlighting/stl/github_linguist/languages-entry.yml
+@@ -0,0 +1,15 @@
++# Snippet to add to lib/linguist/languages.yml in a fork of
++# https://github.com/github-linguist/linguist.
++#
++# Insert this entry alphabetically (it will land between "Self" and "ShaderLab"
++# in current Linguist). language_id is auto-assigned by the Linguist
++# maintainers during PR review - leave the placeholder and ask in the PR.
++
++Sen STL:
++  type: programming
++  color: "#c97660"
++  extensions:
++    - ".stl"
++  tm_scope: source.stl
++  ace_mode: text
++  language_id: 000000   # TBD - Linguist maintainers assign a unique id
+diff --git a/resources/syntax_highlighting/stl/github_linguist/sample-selection.md b/resources/syntax_highlighting/stl/github_linguist/sample-selection.md
+new file mode 100644
+index 0000000..1f5ec99
+--- /dev/null
++++ b/resources/syntax_highlighting/stl/github_linguist/sample-selection.md
+@@ -0,0 +1,41 @@
++# Linguist sample-file selection
++
++Linguist trains its language classifier on real-world samples stored under
++`samples/<Language>/` in the Linguist repo. For a new language a handful of
++representative files is enough.
++
++## What Linguist expects
++
++- At least one sample under `samples/Sen STL/`.
++- Prefer 3-5 files covering the declaration kinds (struct, enum, variant,
++  class, interface, quantity, alias). Short files are fine.
++- **Do not** include samples that would also parse as stereolithography STL.
++  Every sample must start with a `package` declaration or contain a clear
++  STL declaration keyword near the top, so the heuristic picks Sen STL.
++
++## Candidate files in the Sen repository
++
++These are good candidates because they are small, cover different declaration
++kinds, and use the canonical Sen style. Copy them verbatim into Linguist's
++`samples/Sen STL/` directory as part of the PR.
++
++| Sen repo path                                    | Why include it                                |
++| ------------------------------------------------ | --------------------------------------------- |
++| `stl/sen/kernel/build_info.stl`                  | Canonical struct with enums and imports.      |
++| `stl/sen/kernel/kernel_api.stl`                  | Class with methods, events, attributes.       |
++| `stl/sen/kernel/basic_types.stl`                 | Quantities, aliases, primitive types.         |
++| `stl/sen/transport/*.stl` (pick one)             | Larger real-world file with inheritance.      |
++| `components/term/stl/term.stl` (if applicable)   | Variant + tagged-union style.                 |
++
++Adjust the list before submission if any of these paths have changed; the
++point is to show Linguist the full syntactic surface so its classifier does
++not confuse `.stl` with stereolithography even for files that do not start
++with `package`.
++
++## Checklist
++
++1. Copy selected files into `samples/Sen STL/` in your Linguist fork,
++   keeping original filenames.
++2. Run `bundle exec rake samples` to update the classifier index.
++3. Run `bundle exec rake test` and ensure the new samples classify as
++   `Sen STL`.
+-- 
+2.51.0
+

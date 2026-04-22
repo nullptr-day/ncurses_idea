@@ -1,0 +1,351 @@
+From cd8f0c5530551daea81df33403ecd23cc98b47ac Mon Sep 17 00:00:00 2001
+From: Enrique Parodi Spalazzi <enrique.parodi@airbus.com>
+Date: Thu, 23 Apr 2026 01:05:31 +0200
+Subject: [PATCH 4/4] docs[stl]: refactor user guide for clarity and
+ completeness
+
+Editorial pass on stl.md on top of the earlier grammar-reference commit:
+
+- Rename the document to "The Sen Type Language (STL)" and rewrite the
+  opener so it no longer leans on the word "interfaces".
+- Replace the Person hello-world with a TemperatureSensor example that
+  showcases a static property, a writable property, a const method with
+  a return type, and a confirmed event.
+- Promote "Value types vs classes" to a top-level section right after
+  Basic types, since it is the load-bearing concept that governs where
+  every subsequent type can appear.
+- Add a Literals section documenting the minimal literal syntax (no
+  escape sequences, decimal-only integers, decimal-point-required
+  floats).
+- Add a cross-package usage example under File structure so readers
+  learn how to reference types from imported packages by qualified
+  name.
+- Document the tag: attribute with a realistic vital/audit example
+  showing how tags unlock cross-class meta-queries.
+- Reword the abstract-class explanation to drop the circular phrasing
+  and clarify the role of the C++ implementation.
+- Tighten the variant semantics sentence so it no longer hints at a
+  valueless state.
+- Expand the alias example with one that aliases a struct from another
+  package, matching the aliases-are-shortcuts-for-anything framing.
+- Drop the historical NOTE in "Customizing the generated code" that
+  described why the feature moved out of STL; that context belongs in
+  git history, not the user guide.
+- Fix a "per STL files" typo and reword the misleading "ASCII string"
+  cell in the basic-types table.
+- Remove em dashes throughout so the document matches the project's
+  prose conventions.
+
+No grammar or parser changes; documentation only.
+---
+ docs/users_guide/stl.md | 190 ++++++++++++++++++++++++++++------------
+ 1 file changed, 133 insertions(+), 57 deletions(-)
+
+diff --git a/docs/users_guide/stl.md b/docs/users_guide/stl.md
+index b3744ed..8cf1db4 100644
+--- a/docs/users_guide/stl.md
++++ b/docs/users_guide/stl.md
+@@ -1,28 +1,29 @@
+-# Defining Interfaces with the Sen Type Language
++# The Sen Type Language (STL)
+ 
+-Sen has its own little language for you to define your interfaces in a convenient way.
++STL is Sen's small declarative language for describing the shape of
++components: their configurable data, their events, and the operations they
++expose.
+ 
+ > Looking for the exact syntax rules? See the [formal grammar reference](stl_grammar.md)
+ > for tokens, EBNF production rules, and the full list of registered quantity units.
+ 
+ This is an example:
+ 
+-```rust title="person.stl"
+-package school;
++```rust title="temperature_sensor.stl"
++package sensors;
+ 
+-class Person
++// Periodically reports temperature from a configured hardware source.
++class TemperatureSensor
+ {
+-  var firstName     : string [static];
+-  var surName       : string [static];
+-  var brainActivity : f32;
++  var modelName  : string [static];   // configured once per instance
++  var sampleRate : f32    [writable]; // sampling rate in Hz
+ 
+-  // method that takes a string and returns another
+-  // @param question the thing that you want to ask
+-  fn ask(question : string) -> string;
++  // Read the current temperature, in degrees Celsius.
++  fn read() -> f32 [const];
+ 
+-  // an event that requires confirmed transport
+-  // @param words what the person wants to say
+-  event saidSomething(words : string) [confirmed];
++  // Emitted whenever a new sample is available.
++  // @param value the freshly sampled temperature
++  event sampleReady(value: f32) [confirmed];
+ }
+ ```
+ 
+@@ -30,20 +31,22 @@ class Person
+ 
+ 1. [File structure](#file-structure)
+ 2. [Basic types](#basic-types)
+-3. [Sequences and arrays](#sequences-and-arrays)
+-4. [Optional values](#optional-values)
+-5. [Quantities](#quantities)
+-6. [Aliases](#aliases)
+-7. [Enumerations](#enumerations)
+-8. [Structures](#structures)
+-9. [Variants](#variants)
+-10. [Classes](#classes)
+-11. [Attributes](#attributes)
+-12. [Customizing the generated code](#customizing-the-generated-code)
+-13. [Documenting STL files](#documenting-stl-files)
+-14. [Importing HLA-FOM-defined types](#importing-hla-fom-defined-types)
+-15. [Quick reference](#quick-reference)
+-16. [Examples](#examples)
++3. [Literals](#literals)
++4. [Value types vs classes](#value-types-vs-classes)
++5. [Sequences and arrays](#sequences-and-arrays)
++6. [Optional values](#optional-values)
++7. [Quantities](#quantities)
++8. [Aliases](#aliases)
++9. [Enumerations](#enumerations)
++10. [Structures](#structures)
++11. [Variants](#variants)
++12. [Classes](#classes)
++13. [Attributes](#attributes)
++14. [Customizing the generated code](#customizing-the-generated-code)
++15. [Documenting STL files](#documenting-stl-files)
++16. [Importing HLA-FOM-defined types](#importing-hla-fom-defined-types)
++17. [Quick reference](#quick-reference)
++18. [Examples](#examples)
+ 
+ ## File structure
+ 
+@@ -64,7 +67,7 @@ import "stl/sen/kernel/basic_types.stl"
+ You can import as many STL files as you need.
+ 
+ STL files specify a *package*, which is a namespace where the types will be held. There can only be
+-one package declaration per STL files. Multiple STL files might declare the same package. For
++one package declaration per STL file. Multiple STL files might declare the same package. For
+ example:
+ 
+ ```title="package declaration"
+@@ -75,6 +78,21 @@ package sen.kernel;
+ // .. types
+ ```
+ 
++To use a type defined in another package, import the STL file that declares it
++and reference the type by its qualified name (`<package>.<typename>`):
++
++```rust title="using a type from another package"
++import "stl/sen/kernel/basic_types.stl"
++
++package my_app;
++
++struct ComponentHealth
++{
++  name  : string,
++  build : sen.kernel.BuildInfo // qualified name
++}
++```
++
+ ## Basic types
+ 
+ Sen defines the following basic types:
+@@ -91,10 +109,49 @@ Sen defines the following basic types:
+ | `f32`       | 32-bit floating point.    | `float`       |
+ | `f64`       | 64-bit floating point.    | `double`      |
+ | `bool`      | Boolean.                  | `bool`        |
+-| `string`    | ASCII string.             | `std::string` |
++| `string`    | Character string.         | `std::string` |
+ | `TimeStamp` | A point in time.          | `TimeStamp`   |
+ | `Duration`  | A time duration.          | `Duration`    |
+ 
++## Literals
++
++Literals appear in attribute values (`[min: -90.0]`, `[tag: my_tag]`) and
++inside enum storage declarations. STL's literal syntax is deliberately
++minimal:
++
++- **Strings** are double-quoted (`"hello"`) or single-quoted (`'hello'`).
++  Escape sequences (`\n`, `\t`, ...) are **not** interpreted; the characters
++  between the quotes are taken literally.
++- **Integers** are decimal only, optionally prefixed with `-`. Hexadecimal
++  (`0x...`), octal, binary, exponent forms, and type suffixes are not
++  supported.
++- **Floats** require a decimal point. Write `1.0`, not `1`; the decimal
++  point is what distinguishes a float from an integer.
++- **Booleans** are `true` and `false`.
++
++## Value types vs classes
++
++Most of STL is about **value types**: types whose instances can be copied
++and transferred wholesale between components, across the network, or into
++storage. The following are value types:
++
++- Basic types (`u32`, `bool`, `string`, `TimeStamp`, `Duration`, ...)
++- Containers (`sequence`, `array`, `optional`, `quantity`)
++- Custom types declared with `enum`, `struct`, `variant`, `alias`
++
++**Classes are not value types.** A class represents a live component with
++identity and behaviour; it cannot appear as a property type, a struct field,
++a variant alternative, a method parameter, or a return value. When you need
++to reference another object from a value-typed context, store an identifier
++(a name, an ID, or some other differentiator) and resolve it at query time
++with a `SELECT` statement. Sen will translate that identifier into an
++object pointer, including when disambiguation across multiple matches is
++needed.
++
++Keep this distinction in mind as you read the sections below: it is the
++reason every "what can I put here?" question has the same answer, a value
++type.
++
+ ## Sequences and arrays
+ 
+ Sequences are lists of elements. They can be bounded or unbounded and store any value type.
+@@ -181,11 +238,15 @@ two identifiers sit side-by-side.
+ For example,
+ 
+ ```rust
+-alias DeviceId u64;
+-alias NameList sequence<string>;
++alias DeviceId       u64;
++alias NameList       sequence<string>;
+ alias CoordinatePair array<f64, 2>;
++alias HostBuildInfo  sen.kernel.BuildInfo; // aliasing a struct from another package
+ ```
+ 
++Aliases shine once you've declared your own structs, variants, and enums:
++any of them can be given a second name for clarity at the call site.
++
+ ## Enumerations
+ 
+ In STL, enumeration types are defined like this:
+@@ -257,11 +318,12 @@ struct RestoreCursorPosition;
+ 
+ ## Variants
+ 
+-The variant type represents a type-safe union. An instance of variant at any given time either holds
+-a value of one of its alternative types, or in the case of error - no value. As with unions, if a
+-variant holds a value of some object type T, the object representation of T is allocated directly
+-within the object representation of the variant itself. Variant is not allowed to allocate
+-additional (dynamic) memory. A variant is *not* permitted to hold the same type more than once.
++The variant type represents a type-safe union. A variant instance always
++holds a value of exactly one of its alternative types. As with unions, the
++object representation of the held type is allocated directly within the
++variant's own object representation, with no additional (dynamic) memory
++involved. A variant is **not** permitted to list the same type more than
++once.
+ 
+ They are defined as follows:
+ 
+@@ -352,8 +414,9 @@ class MySubClass : extends MyClass
+ 
+ A class may `extends` at most one parent class.
+ 
+-If a class is marked as "abstract" it means that we demand an implementation for it. The Sen kernel
+-will refuse to instantiate an abstract class without an implementation.
++If a class is marked as `abstract`, the Sen kernel will refuse to instantiate
++it without a dedicated C++ implementation. Non-abstract classes can be
++instantiated directly from configuration.
+ 
+ There are 3 kinds of members that a class can have: properties, methods and events.
+ 
+@@ -419,24 +482,15 @@ class Person
+ ```
+ 
+ The attribute vocabulary for properties, methods, and events is listed in the
+-[Attributes](#attributes) section.
+-
+-> **Classes are not value types.** Classes cannot be used for properties, arguments,
+-> function returns, struct fields, etc. This is because they are not considered to be
+-> "value" types — value types are those that can only contain data, and therefore can
+-> be safely transferred between components and over the network in a self-contained
+-> manner. If you need to include a reference to some other object, the best is to use
+-> some kind of identifier (the name, the ID, or some other differentiator). The
+-> translation between this identifier is done by the client using a `SELECT` statement,
+-> that way Sen can resolve it to an object pointer (also allowing for the evaluation
+-> of multiple data elements if disambiguation is needed).
++[Attributes](#attributes) section. Remember that property types, method
++parameters, and return types must be [value types](#value-types-vs-classes).
+ 
+ ## Attributes
+ 
+ Attributes decorate a declaration with metadata. They appear in square brackets
+ at the end of the declaration, before the `;`, and are separated by commas.
+ 
+-Most attributes are **flags** — their name on its own turns the flag on. A few
++Most attributes are **flags**: their name on its own turns the flag on. A few
+ take a value, written as `name: value` (e.g. `min: 0.0`, `tag: my_tag`).
+ 
+ The table below lists every attribute and which declarations it applies to.
+@@ -444,7 +498,7 @@ The table below lists every attribute and which declarations it applies to.
+ | Attribute            | Property | Method | Event | Quantity | Meaning                                                                                   |
+ | -------------------- | :------: | :----: | :---: | :------: | ----------------------------------------------------------------------------------------- |
+ | `static`             | ✓        |        |       |          | The property never changes during the lifetime of the object.                             |
+-| `static_no_config`   | ✓        |        |       |          | Static and cannot be set from YAML configuration — only from the implementation.          |
++| `static_no_config`   | ✓        |        |       |          | Static and cannot be set from YAML configuration; only from the implementation.           |
+ | `writable`           | ✓        |        |       |          | The property has a public setter (it can be set externally).                              |
+ | `confirmed`          | ✓        | ✓      | ✓     |          | Transport is reliable. Default for methods; opt-in for properties and events.             |
+ | `bestEffort`         | ✓        | ✓      | ✓     |          | Transport uses best-effort mechanisms. Default for events; opt-in for methods/properties. |
+@@ -466,6 +520,32 @@ Properties do **not** support a default-value syntax (`var x : u32 = 5 [static];
+ not valid). Initial values come from the component's YAML configuration, or from
+ the implementation at construction time.
+ 
++### Tagging properties
++
++The `tag: <name>` attribute is the mechanism for user-defined labelling of
++properties. Tags are inspectable at runtime through Sen's meta-reflection API
++and let you group properties across unrelated classes for filtering,
++selection, or UI purposes, without those classes having to share a common
++ancestor. A property may carry multiple tags:
++
++```rust
++class Patient
++{
++  var heartRate     : f32       [writable, tag: vital, tag: continuous];
++  var bloodPressure : f32       [writable, tag: vital];
++  var lastVisit     : TimeStamp [tag: audit];
++}
++
++class Incubator
++{
++  var internalTemp  : f32 [writable, tag: vital, tag: continuous];
++}
++```
++
++A query can then ask for "every `vital`-tagged property across the system"
++and get back `heartRate`, `bloodPressure`, and `internalTemp` in a single
++result, regardless of which class they belong to.
++
+ ## Customizing the generated code
+ 
+ If you are generating C++ code, there are some knobs you can use to customize the output:
+@@ -494,10 +574,6 @@ To generate the code in this way, you use a JSON file that may look as follows:
+ }
+ ```
+ 
+-NOTE: In the past, we used STL to annotate deferred methods and checked properties, but this led to
+-a situation where implementation-related customizations were triggering interface updates, even when
+-there was no effect to the client.
+-
+ ## Documenting STL files
+ 
+ You can add comments to STL files in two main ways:
+@@ -505,7 +581,7 @@ You can add comments to STL files in two main ways:
+ - **Before comments** → placed right before the declaration.
+ - **Inline comments** → placed at the end of the same line as the declaration.
+ 
+-Only line comments (`//`) are supported — there is no block-comment syntax.
++Only line comments (`//`) are supported; there is no block-comment syntax.
+ 
+ ### General rules
+ 
+-- 
+2.51.0
+
