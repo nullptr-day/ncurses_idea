@@ -1,0 +1,4501 @@
+From 311b0354a44c7d6e2fb294e6f4f3867cb3842e94 Mon Sep 17 00:00:00 2001
+From: Enrique Parodi Spalazzi <enrique.parodi@airbus.com>
+Date: Fri, 24 Apr 2026 23:55:39 +0200
+Subject: [PATCH] feat[cli]: audit, renames, and shell completion
+ infrastructure
+
+Normalize help text across every cli_* binary to imperative form
+("Run a sen kernel", not "runs a sen kernel"), tighten descriptions,
+fix a bracket mismatch in cli_remote_shell's positional hint, and
+remove dead code (getEnumerators and the local toSnakeCase /
+isUpperCamelCase duplicated across packages).
+
+Rename subcommands and options to match the docker/gh/terraform
+conventions while keeping the old names as hidden aliases so existing
+scripts and CMake call-sites keep working: `sen gen` to `sen generate`,
+`sen fileToArray` to `sen file-to-array`, `sen gen exp_package` to
+`sen generate cpp exports`, and `--base_path` to `--base-path`.
+Aliases are marked `->group("")`, which hides them from --help and
+flags them deprecated in the spec so completion scripts omit them.
+
+Add a cli_common library that exposes a JSON spec format for CLI
+apps (via buildSpecJson and a `--dump-spec` runtime hook) and the
+addChoice helper that surfaces IsMember choice lists into the spec,
+with an overload that carries per-choice descriptions. Every cli_*
+binary now calls dumpSpecIfRequested before CLI11_PARSE.
+
+Add a shell-completion pipeline under apps/cli_gen/src/completions:
+cli_gen runs each binary with --dump-spec, merges the specs, and
+renders self-contained bash, zsh, fish and PowerShell scripts. The
+scripts do not call sen at runtime so completion stays fast. Shells
+that support descriptions (zsh, fish, PowerShell) render them next
+to each candidate; bash falls back to plain names. Already-typed
+non-value flags are filtered out of further suggestions, and --help
+and --version are surfaced to match docker/gh/terraform. The internal
+--dump-spec flag, the one-shot `sen completion` subcommand, and the
+internal `sen generate completions` subcommand are hidden from both
+--help and the generated completion scripts.
+
+Consolidate the scattered case-conversion helpers into a new
+libs/core/base/string_case module (plus unit tests), and update
+cli_package and lang/fom_document_set to use it. The module adds
+toPascalCase alongside the flattening toUpperCamelCase, with a
+doc-comment footgun note on the difference between the two.
+
+Docs: rename every `sen gen` snippet to `sen generate`, fix the
+pre-existing MKDocs section title typos, add root-level snippets
+for `sen generate uml` and `sen generate mkdocs` (for symmetry with
+cpp), add a `C++ exports` subsection, and add a new "Shell completion"
+section covering bash, zsh, fish and PowerShell setup.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ CMakeLists.txt                                |   6 +-
+ apps/cli_archive/CMakeLists.txt               |   1 +
+ apps/cli_archive/main.cpp                     |   7 +-
+ apps/cli_common/CMakeLists.txt                |  37 ++
+ apps/cli_common/include/sen/cli/spec.h        | 109 ++++++
+ apps/cli_common/src/spec.cpp                  | 220 +++++++++++
+ apps/cli_common/test/CMakeLists.txt           |  24 ++
+ apps/cli_common/test/spec_test.cpp            | 198 ++++++++++
+ apps/cli_gen/CMakeLists.txt                   |  52 +++
+ apps/cli_gen/src/CMakeLists.txt               |  42 ++
+ apps/cli_gen/src/common/util.cpp              |  16 +-
+ .../src/completions/completion_tree.cpp       | 368 ++++++++++++++++++
+ .../cli_gen/src/completions/completion_tree.h | 206 ++++++++++
+ .../src/completions/completions_generator.cpp |  93 +++++
+ .../src/completions/completions_generator.h   |  20 +
+ apps/cli_gen/src/completions/emitters.cpp     | 141 +++++++
+ apps/cli_gen/src/completions/spec_merge.cpp   | 100 +++++
+ apps/cli_gen/src/completions/spec_merge.h     |  34 ++
+ .../cli_gen/src/completions/templates/bash.j2 | 117 ++++++
+ .../cli_gen/src/completions/templates/fish.j2 | 128 ++++++
+ .../src/completions/templates/powershell.j2   | 132 +++++++
+ apps/cli_gen/src/completions/templates/zsh.j2 | 128 ++++++
+ apps/cli_gen/src/cpp/cpp_generator.cpp        |  43 +-
+ apps/cli_gen/src/json/json_generator.cpp      |  16 +-
+ apps/cli_gen/src/main.cpp                     |  11 +-
+ apps/cli_gen/src/mkdocs/mkdocs_generator.cpp  |   6 +-
+ .../src/plantuml/plantuml_generator.cpp       |  10 +-
+ apps/cli_gen/src/python/python_generator.cpp  |   2 +-
+ apps/cli_gen/test/CMakeLists.txt              |   2 +
+ apps/cli_gen/test/completions/CMakeLists.txt  |  64 +++
+ .../test/completions/completion_tree_test.cpp | 186 +++++++++
+ .../test/completions/emitters_test.cpp        | 131 +++++++
+ .../test/completions/spec_merge_test.cpp      | 106 +++++
+ apps/cli_package/CMakeLists.txt               |   1 +
+ apps/cli_package/init_component.cpp           |   7 +-
+ apps/cli_package/init_package.cpp             |  37 +-
+ apps/cli_package/main.cpp                     |   7 +-
+ apps/cli_package/util.cpp                     |  47 ---
+ apps/cli_package/util.h                       |   6 -
+ apps/cli_remote_shell/CMakeLists.txt          |   1 +
+ apps/cli_remote_shell/main.cpp                |   7 +-
+ apps/cli_run/CMakeLists.txt                   |   1 +
+ apps/cli_run/main.cpp                         |  31 +-
+ apps/cli_sen/CMakeLists.txt                   |   1 +
+ apps/cli_sen/main.cpp                         | 122 +++++-
+ cmake/util/sen_misc_utils.cmake               |   2 +-
+ cmake/util/sen_package_utils.cmake            |   2 +-
+ docs/CMakeLists.txt                           |  64 +--
+ docs/users_guide/command_line.md              | 117 ++++--
+ libs/core/CMakeLists.txt                      |   6 +-
+ libs/core/include/sen/core/base/string_case.h |  40 ++
+ libs/core/src/base/string_case.cpp            | 107 +++++
+ libs/core/src/lang/fom_document_set.cpp       |  26 +-
+ libs/core/test/CMakeLists.txt                 |   1 +
+ libs/core/test/base/string_case_test.cpp      |  67 ++++
+ 55 files changed, 3222 insertions(+), 234 deletions(-)
+ create mode 100644 apps/cli_common/CMakeLists.txt
+ create mode 100644 apps/cli_common/include/sen/cli/spec.h
+ create mode 100644 apps/cli_common/src/spec.cpp
+ create mode 100644 apps/cli_common/test/CMakeLists.txt
+ create mode 100644 apps/cli_common/test/spec_test.cpp
+ create mode 100644 apps/cli_gen/src/completions/completion_tree.cpp
+ create mode 100644 apps/cli_gen/src/completions/completion_tree.h
+ create mode 100644 apps/cli_gen/src/completions/completions_generator.cpp
+ create mode 100644 apps/cli_gen/src/completions/completions_generator.h
+ create mode 100644 apps/cli_gen/src/completions/emitters.cpp
+ create mode 100644 apps/cli_gen/src/completions/spec_merge.cpp
+ create mode 100644 apps/cli_gen/src/completions/spec_merge.h
+ create mode 100644 apps/cli_gen/src/completions/templates/bash.j2
+ create mode 100644 apps/cli_gen/src/completions/templates/fish.j2
+ create mode 100644 apps/cli_gen/src/completions/templates/powershell.j2
+ create mode 100644 apps/cli_gen/src/completions/templates/zsh.j2
+ create mode 100644 apps/cli_gen/test/completions/CMakeLists.txt
+ create mode 100644 apps/cli_gen/test/completions/completion_tree_test.cpp
+ create mode 100644 apps/cli_gen/test/completions/emitters_test.cpp
+ create mode 100644 apps/cli_gen/test/completions/spec_merge_test.cpp
+ create mode 100644 libs/core/include/sen/core/base/string_case.h
+ create mode 100644 libs/core/src/base/string_case.cpp
+ create mode 100644 libs/core/test/base/string_case_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d8c2afe..4fcd99d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -82,12 +82,16 @@ add_subdirectory(libs/db/bindings/python)
+ add_subdirectory(libs/util)
+ 
+ # apps
++add_subdirectory(apps/cli_common)
+ add_subdirectory(apps/cli_sen)
+ add_subdirectory(apps/cli_run)
+-add_subdirectory(apps/cli_gen)
+ add_subdirectory(apps/cli_archive)
+ add_subdirectory(apps/cli_package)
+ add_subdirectory(apps/cli_remote_shell)
++# cli_gen is added last because its CMakeLists drives the shell-completion pipeline that
++# invokes --dump-spec on every other cli_* binary; that requires the sibling targets to exist
++# already when its add_custom_commands are registered.
++add_subdirectory(apps/cli_gen)
+ 
+ # critical components
+ add_subdirectory(components/shell)
+diff --git a/apps/cli_archive/CMakeLists.txt b/apps/cli_archive/CMakeLists.txt
+index b0360e3..77eac2c 100644
+--- a/apps/cli_archive/CMakeLists.txt
++++ b/apps/cli_archive/CMakeLists.txt
+@@ -12,6 +12,7 @@ add_executable(cli_archive main.cpp)
+ target_link_libraries(
+   cli_archive
+   PUBLIC sen::core sen::db
++  PRIVATE sen::cli_common
+   PRIVATE "$<BUILD_INTERFACE:CLI11::CLI11>"
+ )
+ 
+diff --git a/apps/cli_archive/main.cpp b/apps/cli_archive/main.cpp
+index ecdcb40..9fc7e59 100644
+--- a/apps/cli_archive/main.cpp
++++ b/apps/cli_archive/main.cpp
+@@ -6,6 +6,7 @@
+ // =====================================================================================================================
+ 
+ // sen
++#include "sen/cli/spec.h"
+ #include "sen/core/base/assert.h"
+ #include "sen/core/base/duration.h"
+ #include "sen/core/base/numbers.h"
+@@ -47,7 +48,7 @@ void setupInfo(CLI::App& app)
+ 
+   auto args = std::make_shared<Args>();
+ 
+-  auto cmd = app.add_subcommand("info", "prints basic information about an archive");
++  auto cmd = app.add_subcommand("info", "Print basic information about an archive");
+   cmd->add_option("archive_path", args->archivePath, "Archive path")->required()->check(CLI::ExistingDirectory);
+   cmd->callback(
+     [args]()
+@@ -85,7 +86,7 @@ void setupIndexed(CLI::App& app)
+   };
+   auto args = std::make_shared<Args>();
+ 
+-  auto cmd = app.add_subcommand("indexed", "prints basic info about the indexed objects");
++  auto cmd = app.add_subcommand("indexed", "Print basic info about the indexed objects");
+   cmd->add_option("archive_path", args->archivePath, "Archive path")->required()->check(CLI::ExistingDirectory);
+   cmd->callback(
+     [args]()
+@@ -153,6 +154,8 @@ int runApp(int argc, char* argv[])
+ 
+   app.footer("For help on specific commands run 'sen archive <command> --help'");
+ 
++  sen::cli::dumpSpecIfRequested(argc, argv, app);
++
+   CLI11_PARSE(app, argc, argv);
+   return 0;
+ }
+diff --git a/apps/cli_common/CMakeLists.txt b/apps/cli_common/CMakeLists.txt
+new file mode 100644
+index 0000000..bbc48a4
+--- /dev/null
++++ b/apps/cli_common/CMakeLists.txt
+@@ -0,0 +1,37 @@
++# === CMakeLists.txt ===================================================================================================
++#                                               Sen Infrastructure
++#                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++#                                    See the LICENSE.txt file for more information.
++#                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++# ======================================================================================================================
++
++include(tps/cli11)
++include(tps/json)
++
++set(cli_common_headers include/sen/cli/spec.h)
++
++set(cli_common_sources src/spec.cpp)
++
++add_library(cli_common STATIC ${cli_common_headers} ${cli_common_sources})
++add_library(sen::cli_common ALIAS cli_common)
++
++target_include_directories(
++  cli_common
++  PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
++)
++
++target_link_libraries(
++  cli_common
++  PUBLIC sen::core
++  PUBLIC $<BUILD_INTERFACE:CLI11::CLI11>
++  PRIVATE $<BUILD_INTERFACE:nlohmann_json::nlohmann_json>
++)
++
++sen_enable_static_analysis(cli_common)
++
++source_group("headers" FILES ${cli_common_headers})
++source_group("sources" FILES ${cli_common_sources})
++
++if(SEN_BUILD_TESTS)
++  add_subdirectory(test)
++endif()
+diff --git a/apps/cli_common/include/sen/cli/spec.h b/apps/cli_common/include/sen/cli/spec.h
+new file mode 100644
+index 0000000..7335805
+--- /dev/null
++++ b/apps/cli_common/include/sen/cli/spec.h
+@@ -0,0 +1,109 @@
++// === spec.h =========================================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#ifndef SEN_APPS_CLI_COMMON_SPEC_H
++#define SEN_APPS_CLI_COMMON_SPEC_H
++
++// cli11
++#include <CLI/App.hpp>
++
++// std
++#include <string>
++#include <vector>
++
++// --------------------------------------------------------------------------------------------
++// Spec JSON format
++//
++// buildSpecJson produces a document with the following shape. The format is the sole contract
++// between each CLI binary (which emits it via --dump-spec) and the shell-completion generator
++// (cli_gen gen completions) that consumes it. Tools reading the spec should tolerate unknown
++// extra fields so additions do not break consumers.
++//
++//   {
++//     "name":               "sen run",           // display name from CLI::App::name()
++//     "path":               ["sen", "run"],      // subcommand path from root; tokens are the
++//                                                // leaf names of each enclosing app
++//     "description":        "Run a sen kernel",
++//     "allow_extras":       false,               // CLI::App::allow_extras()
++//     "require_subcommand": false,               // true if CLI::App::require_subcommand_min()>0
++//     "options": [
++//       {
++//         "kind":        "option",               // one of "option", "flag", "positional"
++//         "name":        "--preset",             // CLI11's get_name() form
++//         "long":        ["--preset"],           // long names, each with leading "--"
++//         "short":       [],                     // short names, each with leading "-"
++//         "description": "Preset name",
++//         "required":    false,
++//         "type_name":   "TEXT:{shell,explorer,replay}", // CLI11 type hint (see below)
++//         "choices":     ["shell", "explorer", "replay"], // set only by sen::cli::addChoice
++//         "deprecated":  false                   // true for hidden aliases (stage 3)
++//       }
++//     ],
++//     "subcommands": [ /* recursive: same shape */ ]
++//   }
++//
++// The "kind" field classifies options:
++//   - "positional": positional argument (no leading dashes; "type_name" describes it)
++//   - "flag":       boolean switch that takes no value
++//   - "option":     named option that consumes a value
++//
++// The "type_name" field mirrors CLI11's type hint and follows the form "<base>[:<validator>]".
++// Common suffixes: ":FILE" (existing file), ":DIR" (existing directory), ":PATH(existing)"
++// (existing path, file or directory), ":{a,b,c}" (IsMember choice set). Emitters look for
++// these suffixes to drive file / directory / choice completion.
++//
++// Built-in --help and --version flags are included in the spec alongside the tool's own
++// options; modern CLIs (docker, gh, terraform) surface them in shell completions and users
++// expect the same.
++// --------------------------------------------------------------------------------------------
++
++namespace sen::cli
++{
++
++/// Walks a configured CLI11 App tree and produces a JSON document describing subcommands,
++/// options, flags and positional arguments. Returned string is pretty-printed with a 2-space
++/// indent. See the block comment above for the exact schema.
++std::string buildSpecJson(const CLI::App& app);
++
++/// A choice value paired with a human-readable description, consumed by addChoice's described
++/// overload to carry per-value hints into the generated completion scripts.
++struct Choice
++{
++  std::string value;
++  std::string description;
++};
++
++/// Adds a choice-validated option to a CLI11 app and records the choice list so buildSpecJson
++/// can surface it under the option's "choices" field. Functionally equivalent to
++/// app.add_option(...)->check(CLI::IsMember(choices)); the difference is that the choices
++/// survive CLI11's validator encoding and reach the spec intact.
++CLI::Option* addChoice(CLI::App& app,
++                       const std::string& name,
++                       std::string& target,
++                       std::vector<std::string> choices,
++                       const std::string& description);
++
++/// Same as addChoice but attaches a human-readable description to each choice value. The
++/// descriptions surface in the generated completion scripts for shells that render per-
++/// candidate descriptions (zsh, fish, PowerShell).
++CLI::Option* addChoice(CLI::App& app,
++                       const std::string& name,
++                       std::string& target,
++                       std::vector<Choice> choices,
++                       const std::string& description);
++
++/// Checks argv for the `--dump-spec` flag. If present, prints the JSON spec of the given
++/// CLI11 app to stdout and exits the process with status 0. Otherwise returns without side
++/// effects.
++///
++/// Must be called after the app has been fully configured (all subcommands, options and flags
++/// registered) and before CLI11_PARSE runs.
++void dumpSpecIfRequested(int argc, char* argv[], const CLI::App& app);
++
++}  // namespace sen::cli
++
++#endif  // SEN_APPS_CLI_COMMON_SPEC_H
+diff --git a/apps/cli_common/src/spec.cpp b/apps/cli_common/src/spec.cpp
+new file mode 100644
+index 0000000..56724f7
+--- /dev/null
++++ b/apps/cli_common/src/spec.cpp
+@@ -0,0 +1,220 @@
++// === spec.cpp =======================================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#include "sen/cli/spec.h"
++
++// cli11
++#include <CLI/App.hpp>
++#include <CLI/Option.hpp>
++#include <CLI/Validators.hpp>
++
++// nlohmann
++#include <nlohmann/json.hpp>
++
++// std
++#include <cstdlib>
++#include <iostream>
++#include <sstream>
++#include <string>
++#include <string_view>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++
++namespace sen::cli
++{
++
++namespace
++{
++
++// --------------------------------------------------------------------------------------------
++// Choice side-table
++//
++// CLI11 stores IsMember validators but does not expose the original choice list, so addChoice
++// tucks it into a process-global map keyed by the returned Option pointer. buildSpecJson reads
++// this map to surface choices in the emitted JSON. Lifetime matches the process; CLI setup is
++// single-threaded so no synchronization is needed.
++// --------------------------------------------------------------------------------------------
++
++using ChoiceMap = std::unordered_map<const CLI::Option*, std::vector<Choice>>;
++
++ChoiceMap& choiceMap()
++{
++  static ChoiceMap map;
++  return map;
++}
++
++const std::vector<Choice>& choicesOf(const CLI::Option* option)
++{
++  static const std::vector<Choice> empty;
++  auto it = choiceMap().find(option);
++  return it == choiceMap().end() ? empty : it->second;
++}
++
++// --------------------------------------------------------------------------------------------
++// Spec builder
++// --------------------------------------------------------------------------------------------
++
++std::vector<std::string> withPrefix(const std::vector<std::string>& names, std::string_view prefix)
++{
++  std::vector<std::string> out;
++  out.reserve(names.size());
++  for (const auto& n: names)
++  {
++    out.emplace_back(std::string(prefix) + n);
++  }
++  return out;
++}
++
++nlohmann::json buildOptionJson(const CLI::Option& opt)
++{
++  nlohmann::json j;
++
++  j["kind"] = opt.get_positional()         ? "positional"
++              : opt.get_type_name().empty() ? "flag"
++                                            : "option";
++  j["name"] = opt.get_name();
++  j["long"] = withPrefix(opt.get_lnames(), "--");
++  j["short"] = withPrefix(opt.get_snames(), "-");
++  j["description"] = opt.get_description();
++  j["required"] = opt.get_required();
++  j["type_name"] = opt.get_type_name();
++
++  // Choices are stored in the side-table as (value, description) pairs. The spec surfaces the
++  // values as a flat array (unchanged schema) plus a parallel descriptions array; consumers
++  // that do not care about descriptions can read `choices` alone.
++  const auto& choices = choicesOf(&opt);
++  std::vector<std::string> values;
++  std::vector<std::string> descriptions;
++  values.reserve(choices.size());
++  descriptions.reserve(choices.size());
++  for (const auto& c: choices)
++  {
++    values.push_back(c.value);
++    descriptions.push_back(c.description);
++  }
++  j["choices"] = values;
++  j["choiceDescriptions"] = descriptions;
++
++  // An empty CLI11 group marks an option as hidden from --help; by convention the sen CLI
++  // uses this to flag deprecated aliases. Completion scripts skip entries with deprecated=true.
++  j["deprecated"] = opt.get_group().empty();
++
++  return j;
++}
++
++/// Tokenizes a whitespace-separated app name like "sen run" into ["sen", "run"]. Root binaries
++/// set a multi-word name via app.name() for friendly --help output; subcommands only store
++/// their leaf name (CLI11 does not expose a parent pointer).
++std::vector<std::string> tokenizeAppName(const std::string& name)
++{
++  std::vector<std::string> tokens;
++  std::istringstream iss(name);
++  std::string word;
++  while (iss >> word)
++  {
++    tokens.push_back(word);
++  }
++  return tokens;
++}
++
++nlohmann::json buildAppJson(const CLI::App& app, const std::vector<std::string>& path)
++{
++  nlohmann::json j;
++  j["name"] = app.get_name();
++  j["path"] = path;
++  j["description"] = app.get_description();
++  j["allow_extras"] = app.get_allow_extras();
++  j["require_subcommand"] = app.get_require_subcommand_min() > 0;
++  // Deprecated aliases are marked with an empty CLI11 group (which also hides them from
++  // --help). The completion walker filters subcommands with deprecated=true.
++  j["deprecated"] = app.get_group().empty();
++
++  // --help and --version are first-class options on every sen CLI, so they belong in the
++  // spec alongside the tool's own flags. Most modern tools (docker, gh, terraform) surface
++  // them in shell completions as well.
++  nlohmann::json options = nlohmann::json::array();
++  for (const auto* opt: app.get_options())
++  {
++    if (opt != nullptr)
++    {
++      options.push_back(buildOptionJson(*opt));
++    }
++  }
++  j["options"] = options;
++
++  nlohmann::json subs = nlohmann::json::array();
++  for (const auto* sub: app.get_subcommands({}))
++  {
++    if (sub == nullptr)
++    {
++      continue;
++    }
++    auto childPath = path;
++    childPath.push_back(sub->get_name());
++    subs.push_back(buildAppJson(*sub, childPath));
++  }
++  j["subcommands"] = subs;
++
++  return j;
++}
++
++}  // namespace
++
++std::string buildSpecJson(const CLI::App& app)
++{
++  const auto rootPath = tokenizeAppName(app.get_name());
++  return buildAppJson(app, rootPath).dump(2);
++}
++
++CLI::Option* addChoice(CLI::App& app,
++                       const std::string& name,
++                       std::string& target,
++                       std::vector<std::string> choices,
++                       const std::string& description)
++{
++  auto* option = app.add_option(name, target, description)->check(CLI::IsMember(choices));
++  std::vector<Choice> paired;
++  paired.reserve(choices.size());
++  for (auto& v: choices)
++  {
++    paired.push_back({std::move(v), ""});
++  }
++  choiceMap().emplace(option, std::move(paired));
++  return option;
++}
++
++CLI::Option* addChoice(CLI::App& app,
++                       const std::string& name,
++                       std::string& target,
++                       std::vector<Choice> choices,
++                       const std::string& description)
++{
++  std::vector<std::string> values;
++  values.reserve(choices.size());
++  for (const auto& c: choices)
++  {
++    values.push_back(c.value);
++  }
++  auto* option = app.add_option(name, target, description)->check(CLI::IsMember(values));
++  choiceMap().emplace(option, std::move(choices));
++  return option;
++}
++
++void dumpSpecIfRequested(int argc, char* argv[], const CLI::App& app)
++{
++  for (int i = 1; i < argc; ++i)
++  {
++    if (std::string_view(argv[i]) == "--dump-spec")  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
++    {
++      std::cout << buildSpecJson(app) << '\n';
++      std::exit(EXIT_SUCCESS);
++    }
++  }
++}
++
++}  // namespace sen::cli
+diff --git a/apps/cli_common/test/CMakeLists.txt b/apps/cli_common/test/CMakeLists.txt
+new file mode 100644
+index 0000000..c8b0f9c
+--- /dev/null
++++ b/apps/cli_common/test/CMakeLists.txt
+@@ -0,0 +1,24 @@
++# === CMakeLists.txt ===================================================================================================
++#                                               Sen Infrastructure
++#                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++#                                    See the LICENSE.txt file for more information.
++#                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++# ======================================================================================================================
++
++include(tps/json)
++
++set(cli_common_tests spec_test.cpp)
++
++add_sen_unit_test_suite(
++  cli_common_test
++  ${cli_common_tests}
++  LINK_DEPS
++  sen::core
++  sen::cli_common
++  $<BUILD_INTERFACE:CLI11::CLI11>
++  $<BUILD_INTERFACE:nlohmann_json::nlohmann_json>
++)
++
++set_target_properties(
++  cli_common_test PROPERTIES FOLDER "test" RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin"
++)
+diff --git a/apps/cli_common/test/spec_test.cpp b/apps/cli_common/test/spec_test.cpp
+new file mode 100644
+index 0000000..856f1fe
+--- /dev/null
++++ b/apps/cli_common/test/spec_test.cpp
+@@ -0,0 +1,198 @@
++// === spec_test.cpp ==================================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#include "sen/cli/spec.h"
++
++// cli11
++#include <CLI/App.hpp>
++#include <CLI/CLI.hpp>  // NOLINT(misc-include-cleaner): cli11 needs all headers for vtables
++#include <CLI/Validators.hpp>
++
++// nlohmann
++#include <nlohmann/json.hpp>
++
++// google test
++#include <gtest/gtest.h>
++
++// std
++#include <string>
++#include <tuple>
++
++namespace sen::cli
++{
++
++namespace
++{
++
++nlohmann::json dumpAs(const CLI::App& app)
++{
++  return nlohmann::json::parse(buildSpecJson(app));
++}
++
++const nlohmann::json* findOption(const nlohmann::json& spec, const std::string& name)
++{
++  for (const auto& opt: spec.at("options"))
++  {
++    if (opt.value("name", "") == name)
++    {
++      return &opt;
++    }
++    // Hidden options (empty CLI11 group) come back with get_name() = "" but still carry
++    // the long/short forms; match on those too so tests can locate them by their user-typed
++    // form regardless of visibility.
++    for (const auto& ln: opt.value("long", nlohmann::json::array()))
++    {
++      if (ln.get<std::string>() == name)
++      {
++        return &opt;
++      }
++    }
++  }
++  return nullptr;
++}
++
++}  // namespace
++
++/// @test
++/// Every registered option appears in the spec with its kind classified as option / flag /
++/// positional, and dashes are attached to the long and short forms.
++TEST(SpecTest, classifiesOptionsFlagsAndPositionals)
++{
++  CLI::App app {"test"};
++  app.name("sen test");
++
++  std::string target;
++  bool onoff = false;
++  std::string pos;
++  app.add_option("-i,--input", target, "Input file");
++  app.add_flag("--enable", onoff, "Turn feature on");
++  app.add_option("output", pos, "Output path");
++
++  const auto spec = dumpAs(app);
++
++  const auto* input = findOption(spec, "--input");
++  ASSERT_NE(input, nullptr);
++  EXPECT_EQ(input->at("kind"), "option");
++  EXPECT_EQ(input->at("long"), nlohmann::json::array({"--input"}));
++  EXPECT_EQ(input->at("short"), nlohmann::json::array({"-i"}));
++
++  const auto* enable = findOption(spec, "--enable");
++  ASSERT_NE(enable, nullptr);
++  EXPECT_EQ(enable->at("kind"), "flag");
++
++  const auto* output = findOption(spec, "output");
++  ASSERT_NE(output, nullptr);
++  EXPECT_EQ(output->at("kind"), "positional");
++}
++
++/// @test
++/// --help and --version appear in the spec alongside the tool's own flags. Most modern CLIs
++/// surface them in completion; sen matches that convention so users see them in TAB output.
++TEST(SpecTest, includesBuiltinHelpFlag)
++{
++  CLI::App app {"test"};
++  app.name("sen test");
++
++  const auto spec = dumpAs(app);
++  bool foundHelp = false;
++  for (const auto& opt: spec.at("options"))
++  {
++    const auto name = opt.value("name", "");
++    if (name.find("help") != std::string::npos)
++    {
++      foundHelp = true;
++    }
++  }
++  EXPECT_TRUE(foundHelp);
++}
++
++/// @test
++/// addChoice records the choice list in the spec so completion emitters can surface them.
++TEST(SpecTest, addChoiceSurfacesChoicesInSpec)
++{
++  CLI::App app {"test"};
++  app.name("sen test");
++
++  std::string target;
++  addChoice(app, "--preset", target, {"shell", "explorer", "replay"}, "Preset");
++
++  const auto spec = dumpAs(app);
++  const auto* preset = findOption(spec, "--preset");
++  ASSERT_NE(preset, nullptr);
++  EXPECT_EQ(preset->at("choices"), nlohmann::json::array({"shell", "explorer", "replay"}));
++}
++
++/// @test
++/// The spec encodes an explicit path array at every level; downstream consumers walk the tree
++/// by this array rather than parsing the display name.
++TEST(SpecTest, pathArrayTracksSubcommandHierarchy)
++{
++  CLI::App app {"test"};
++  app.name("sen test");
++  auto* sub = app.add_subcommand("child", "c");
++  sub->add_subcommand("grand", "g");
++
++  const auto spec = dumpAs(app);
++  EXPECT_EQ(spec.at("path"), nlohmann::json::array({"sen", "test"}));
++
++  const auto& child = spec.at("subcommands").at(0);
++  EXPECT_EQ(child.at("path"), nlohmann::json::array({"sen", "test", "child"}));
++
++  const auto& grand = child.at("subcommands").at(0);
++  EXPECT_EQ(grand.at("path"), nlohmann::json::array({"sen", "test", "child", "grand"}));
++}
++
++/// @test
++/// A subcommand or option placed in an empty CLI11 group is marked as deprecated in the spec.
++/// Completion scripts filter deprecated entries, so this is the mechanism the sen CLI uses to
++/// hide backward-compat aliases from TAB completion while keeping them functional.
++TEST(SpecTest, emptyGroupMarksDeprecated)
++{
++  CLI::App app {"test"};
++  app.name("sen test");
++
++  auto* hiddenSub = app.add_subcommand("old-alias", "Hidden alias");
++  hiddenSub->group("");
++
++  std::string value;
++  auto* hiddenOpt = app.add_option("--old-flag", value, "Hidden flag");
++  hiddenOpt->group("");
++
++  auto* visibleSub = app.add_subcommand("visible", "Normal subcommand");
++  std::string other;
++  auto* visibleOpt = app.add_option("--visible-flag", other, "Normal flag");
++
++  const auto spec = dumpAs(app);
++
++  const auto& subs = spec.at("subcommands");
++  for (const auto& sub: subs)
++  {
++    if (sub.at("name") == "old-alias")
++    {
++      EXPECT_TRUE(sub.at("deprecated").get<bool>());
++    }
++    else if (sub.at("name") == "visible")
++    {
++      EXPECT_FALSE(sub.at("deprecated").get<bool>());
++    }
++  }
++
++  const auto* oldFlag = findOption(spec, "--old-flag");
++  ASSERT_NE(oldFlag, nullptr);
++  EXPECT_TRUE(oldFlag->at("deprecated").get<bool>());
++
++  const auto* visibleFlag = findOption(spec, "--visible-flag");
++  ASSERT_NE(visibleFlag, nullptr);
++  EXPECT_FALSE(visibleFlag->at("deprecated").get<bool>());
++
++  std::ignore = hiddenSub;
++  std::ignore = hiddenOpt;
++  std::ignore = visibleSub;
++  std::ignore = visibleOpt;
++}
++
++}  // namespace sen::cli
+diff --git a/apps/cli_gen/CMakeLists.txt b/apps/cli_gen/CMakeLists.txt
+index e1b9dad..e331bbe 100644
+--- a/apps/cli_gen/CMakeLists.txt
++++ b/apps/cli_gen/CMakeLists.txt
+@@ -10,3 +10,55 @@ add_subdirectory(src)
+ if(SEN_BUILD_TESTS)
+   add_subdirectory(test)
+ endif()
++
++# -------------------------------------------------------------------------------------------------------------
++# Shell completion scripts
++#
++# Each CLI binary is run with --dump-spec at build time to produce a JSON spec of its commands,
++# options and flags. The merged spec is then rendered by `cli_gen completions` into bash, zsh,
++# fish and PowerShell scripts, which are installed to share/sen/completions/.
++# -------------------------------------------------------------------------------------------------------------
++
++set(cli_spec_dir ${CMAKE_CURRENT_BINARY_DIR}/cli_spec)
++set(cli_completions_dir ${CMAKE_BINARY_DIR}/share/sen/completions)
++
++file(MAKE_DIRECTORY ${cli_spec_dir})
++file(MAKE_DIRECTORY ${cli_completions_dir})
++
++set(cli_spec_binaries cli_sen cli_run cli_gen cli_archive cli_package cli_remote_shell)
++set(cli_spec_files)
++foreach(_bin IN LISTS cli_spec_binaries)
++  set(_spec ${cli_spec_dir}/${_bin}.json)
++  add_custom_command(
++    OUTPUT ${_spec}
++    COMMAND $<TARGET_FILE:${_bin}> --dump-spec > ${_spec}
++    DEPENDS ${_bin}
++    COMMENT "Dumping CLI spec for ${_bin}"
++    VERBATIM
++  )
++  list(APPEND cli_spec_files ${_spec})
++endforeach()
++
++set(cli_completion_outputs
++    ${cli_completions_dir}/sen.bash
++    ${cli_completions_dir}/_sen
++    ${cli_completions_dir}/sen.fish
++    ${cli_completions_dir}/sen.ps1
++)
++
++set(_spec_args)
++foreach(_spec IN LISTS cli_spec_files)
++  list(APPEND _spec_args --spec ${_spec})
++endforeach()
++
++add_custom_command(
++  OUTPUT ${cli_completion_outputs}
++  COMMAND $<TARGET_FILE:cli_gen> completions ${_spec_args} --out-dir ${cli_completions_dir}
++  DEPENDS cli_gen ${cli_spec_files}
++  COMMENT "Rendering shell completion scripts"
++  VERBATIM
++)
++
++add_custom_target(cli_completions ALL DEPENDS ${cli_completion_outputs})
++
++install(FILES ${cli_completion_outputs} DESTINATION share/sen/completions)
+diff --git a/apps/cli_gen/src/CMakeLists.txt b/apps/cli_gen/src/CMakeLists.txt
+index ceacca8..0d44c76 100644
+--- a/apps/cli_gen/src/CMakeLists.txt
++++ b/apps/cli_gen/src/CMakeLists.txt
+@@ -193,6 +193,44 @@ set(json_sources json/json_generator.cpp json/json_templates.cpp)
+ source_group("json/headers" FILES ${json_headers})
+ source_group("json/sources" FILES ${json_sources})
+ 
++# -------------------------------------------------------------------------------------------------------------
++# Completions Generator
++# -------------------------------------------------------------------------------------------------------------
++
++set(completions_templates
++    completions/templates/bash.j2
++    completions/templates/fish.j2
++    completions/templates/powershell.j2
++    completions/templates/zsh.j2
++)
++
++sen_internal_generate_template_headers(
++  OUTDIR
++  ${CMAKE_CURRENT_BINARY_DIR}/cli_gen/completions_templates
++  GEN_FILE_LIST
++  completions_template_dumps
++  TEMPLATE_FILES
++  ${completions_templates}
++)
++
++set(completions_headers
++    completions/completion_tree.h
++    completions/completions_generator.h
++    completions/spec_merge.h
++)
++
++set(completions_sources
++    completions/completion_tree.cpp
++    completions/completions_generator.cpp
++    completions/emitters.cpp
++    completions/spec_merge.cpp
++)
++
++source_group("completions/headers" FILES ${completions_headers})
++source_group("completions/sources" FILES ${completions_sources})
++source_group("completions/templates" FILES ${completions_templates})
++source_group("completions/templates/dumps" FILES ${completions_template_dumps})
++
+ # -------------------------------------------------------------------------------------------------------------
+ # Executable
+ # -------------------------------------------------------------------------------------------------------------
+@@ -215,6 +253,9 @@ add_executable(
+   ${json_headers}
+   ${json_sources}
+   ${json_template_dumps}
++  ${completions_headers}
++  ${completions_sources}
++  ${completions_template_dumps}
+   main.cpp
+ )
+ 
+@@ -223,6 +264,7 @@ sen_enable_static_analysis(cli_gen)
+ target_link_libraries(
+   cli_gen
+   PUBLIC sen::core
++  PRIVATE sen::cli_common
+   PRIVATE $<BUILD_INTERFACE:nlohmann_json::nlohmann_json>
+   PRIVATE $<BUILD_INTERFACE:pantor::inja>
+   PRIVATE $<BUILD_INTERFACE:CLI11::CLI11>
+diff --git a/apps/cli_gen/src/common/util.cpp b/apps/cli_gen/src/common/util.cpp
+index b8f8c8e..e737610 100644
+--- a/apps/cli_gen/src/common/util.cpp
++++ b/apps/cli_gen/src/common/util.cpp
+@@ -185,11 +185,13 @@ CLI::App* setupStlInput(CLI::App& app, std::function<void(std::shared_ptr<impl::
+ {
+   auto args = std::make_shared<impl::StlArgs>();
+ 
+-  auto stl = app.add_subcommand("stl", "process STL files");
++  auto stl = app.add_subcommand("stl", "Process STL files");
+   stl->add_option("stl_files", args->inputs, "STL files")->required()->check(CLI::ExistingFile);
+   stl->add_option("-i, --import", args->includePaths, "Paths where other STL files can be found");
+-  stl->add_option("-b, --base_path", args->basePath, "base path for including generated files");
+-  stl->add_option("-s, --settings", args->codegenOptionsFile, "code generation settings file")
++  // '--base_path' (snake_case) kept as a hidden alias for backward compatibility; new code
++  // should use '--base-path'. CLI11 accepts either form and writes to the same target.
++  stl->add_option("-b,--base-path,--base_path", args->basePath, "Base path for including generated files");
++  stl->add_option("-s, --settings", args->codegenOptionsFile, "Code generation settings file")
+     ->check(CLI::ExistingFile);
+   stl->callback([args, act = std::move(action)]() { act(args); });
+   return stl;
+@@ -199,17 +201,17 @@ CLI::App* setupFomInput(CLI::App& app, std::function<void(std::shared_ptr<impl::
+ {
+   auto args = std::make_shared<impl::FomArgs>();
+ 
+-  auto fom = app.add_subcommand("fom", "process HLA FOM files");
++  auto fom = app.add_subcommand("fom", "Process HLA FOM files");
+ 
+-  fom->add_option("-m, --mappings", args->mappingFiles, "XML defining custom mappings between sen and hla")
++  fom->add_option("-m, --mappings", args->mappingFiles, "XML defining custom mappings between sen and HLA")
+     ->delimiter(',')
+     ->check(CLI::ExistingFile);
+ 
+-  fom->add_option("-d, --directories", args->paths, "directories containing FOM XML files")
++  fom->add_option("-d, --directories", args->paths, "Directories containing FOM XML files")
+     ->check(CLI::ExistingDirectory)
+     ->required();
+ 
+-  fom->add_option("-s, --settings", args->codegenOptionsFile, "code generation settings file")
++  fom->add_option("-s, --settings", args->codegenOptionsFile, "Code generation settings file")
+     ->check(CLI::ExistingFile);
+ 
+   fom->callback([args, act = std::move(action)]() { act(args); });
+diff --git a/apps/cli_gen/src/completions/completion_tree.cpp b/apps/cli_gen/src/completions/completion_tree.cpp
+new file mode 100644
+index 0000000..1173388
+--- /dev/null
++++ b/apps/cli_gen/src/completions/completion_tree.cpp
+@@ -0,0 +1,368 @@
++// === completion_tree.cpp ============================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#include "completion_tree.h"
++
++// nlohmann
++#include <nlohmann/json.hpp>
++
++// std
++#include <string>
++#include <string_view>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++
++namespace completions
++{
++
++namespace
++{
++
++bool isDeprecated(const nlohmann::json& node)
++{
++  return node.value("deprecated", false);
++}
++
++std::vector<std::string> collectStrings(const nlohmann::json& arr)
++{
++  std::vector<std::string> out;
++  for (const auto& v: arr)
++  {
++    out.push_back(v.get<std::string>());
++  }
++  return out;
++}
++
++std::string joinPath(const nlohmann::json& pathArray)
++{
++  return joinSpace(collectStrings(pathArray));
++}
++
++void collectSubcommands(const nlohmann::json& node, NodeFacts& facts)
++{
++  for (const auto& sub: node.value("subcommands", nlohmann::json::array()))
++  {
++    if (!isDeprecated(sub))
++    {
++      facts.subcommands.push_back({sub.value("name", ""), sub.value("description", "")});
++    }
++  }
++}
++
++void collectPositional(const nlohmann::json& option, NodeFacts& facts)
++{
++  if (!facts.positionalType.empty() || !facts.positionalChoices.empty())
++  {
++    return;  // first positional wins; see TODO in completion_tree.h
++  }
++  facts.positionalType = option.value("type_name", "");
++  if (option.contains("choices"))
++  {
++    facts.positionalChoices = collectStrings(option["choices"]);
++  }
++}
++
++void collectOption(const nlohmann::json& option,
++                   std::string_view path,
++                   NodeFacts& facts,
++                   std::vector<OptionFacts>& optionEntries)
++{
++  std::vector<std::string> tokens = collectStrings(option.value("long", nlohmann::json::array()));
++  for (const auto& s: collectStrings(option.value("short", nlohmann::json::array())))
++  {
++    tokens.push_back(s);
++  }
++
++  const auto description = option.value("description", "");
++  const bool takesValue = option.value("kind", "") == "option";
++  for (const auto& tok: tokens)
++  {
++    facts.allOptionTokens.push_back({tok, description});
++    if (takesValue)
++    {
++      facts.optionsTakingValue.push_back({tok, description});
++    }
++  }
++
++  if (!takesValue)
++  {
++    return;
++  }
++  OptionFacts prototype;
++  prototype.path = std::string(path);
++  prototype.typeName = option.value("type_name", "");
++  // Spec carries choices and choiceDescriptions as parallel arrays; walker zips them into
++  // NamedEntry pairs. Undescribed choices (registered via the string-only addChoice overload)
++  // have an empty description.
++  const auto values = collectStrings(option.value("choices", nlohmann::json::array()));
++  const auto descriptions =
++    collectStrings(option.value("choiceDescriptions", nlohmann::json::array()));
++  prototype.choices.reserve(values.size());
++  for (std::size_t i = 0; i < values.size(); ++i)
++  {
++    const auto desc = i < descriptions.size() ? descriptions[i] : std::string();
++    prototype.choices.push_back({values[i], desc});
++  }
++  for (const auto& tok: tokens)
++  {
++    prototype.token = tok;
++    optionEntries.push_back(prototype);
++  }
++}
++
++void walk(const nlohmann::json& node, CompletionTree& tree)
++{
++  NodeFacts facts;
++  facts.path = joinPath(node.value("path", nlohmann::json::array()));
++
++  collectSubcommands(node, facts);
++
++  for (const auto& opt: node.value("options", nlohmann::json::array()))
++  {
++    if (isDeprecated(opt))
++    {
++      continue;
++    }
++    if (opt.value("kind", "") == "positional")
++    {
++      collectPositional(opt, facts);
++    }
++    else
++    {
++      collectOption(opt, facts.path, facts, tree.options);
++    }
++  }
++
++  tree.nodes.push_back(std::move(facts));
++
++  for (const auto& sub: node.value("subcommands", nlohmann::json::array()))
++  {
++    if (!isDeprecated(sub))
++    {
++      walk(sub, tree);
++    }
++  }
++}
++
++}  // namespace
++
++CompletionTree buildCompletionTree(const nlohmann::json& mergedSpec)
++{
++  CompletionTree tree;
++  walk(mergedSpec, tree);
++  return tree;
++}
++
++std::string joinSpace(const std::vector<std::string>& items)
++{
++  std::string out;
++  for (const auto& it: items)
++  {
++    if (!out.empty())
++    {
++      out += ' ';
++    }
++    out += it;
++  }
++  return out;
++}
++
++namespace
++{
++
++std::string joinSpaceNames(const std::vector<NamedEntry>& entries)
++{
++  std::string out;
++  for (const auto& e: entries)
++  {
++    if (!out.empty())
++    {
++      out += ' ';
++    }
++    out += e.name;
++  }
++  return out;
++}
++
++}  // namespace
++
++KVList subcommandsByPath(const CompletionTree& tree)
++{
++  KVList out;
++  out.reserve(tree.nodes.size());
++  for (const auto& node: tree.nodes)
++  {
++    out.emplace_back(node.path, joinSpaceNames(node.subcommands));
++  }
++  return out;
++}
++
++KVList optionTokensByPath(const CompletionTree& tree)
++{
++  KVList out;
++  out.reserve(tree.nodes.size());
++  for (const auto& node: tree.nodes)
++  {
++    out.emplace_back(node.path, joinSpaceNames(node.allOptionTokens));
++  }
++  return out;
++}
++
++KVList optionsTakingValueByPath(const CompletionTree& tree)
++{
++  KVList out;
++  out.reserve(tree.nodes.size());
++  for (const auto& node: tree.nodes)
++  {
++    out.emplace_back(node.path, joinSpaceNames(node.optionsTakingValue));
++  }
++  return out;
++}
++
++KVList positionalTypesByPath(const CompletionTree& tree)
++{
++  KVList out;
++  for (const auto& node: tree.nodes)
++  {
++    if (!node.positionalType.empty())
++    {
++      out.emplace_back(node.path, node.positionalType);
++    }
++  }
++  return out;
++}
++
++KVList positionalChoicesByPath(const CompletionTree& tree)
++{
++  KVList out;
++  for (const auto& node: tree.nodes)
++  {
++    if (!node.positionalChoices.empty())
++    {
++      out.emplace_back(node.path, joinSpace(node.positionalChoices));
++    }
++  }
++  return out;
++}
++
++KVList optionTypesByKey(const CompletionTree& tree)
++{
++  KVList out;
++  out.reserve(tree.options.size());
++  for (const auto& od: tree.options)
++  {
++    out.emplace_back(od.path + '|' + od.token, od.typeName);
++  }
++  return out;
++}
++
++KVList optionChoicesByKey(const CompletionTree& tree)
++{
++  KVList out;
++  out.reserve(tree.options.size());
++  for (const auto& od: tree.options)
++  {
++    out.emplace_back(od.path + '|' + od.token, joinSpaceNames(od.choices));
++  }
++  return out;
++}
++
++ItemsByPath optionChoiceItemsByKey(const CompletionTree& tree)
++{
++  ItemsByPath out;
++  out.reserve(tree.options.size());
++  for (const auto& od: tree.options)
++  {
++    out.emplace_back(od.path + '|' + od.token, od.choices);
++  }
++  return out;
++}
++
++ItemsByPath subcommandItemsByPath(const CompletionTree& tree)
++{
++  ItemsByPath out;
++  out.reserve(tree.nodes.size());
++  for (const auto& node: tree.nodes)
++  {
++    out.emplace_back(node.path, node.subcommands);
++  }
++  return out;
++}
++
++ItemsByPath optionTokenItemsByPath(const CompletionTree& tree)
++{
++  ItemsByPath out;
++  out.reserve(tree.nodes.size());
++  for (const auto& node: tree.nodes)
++  {
++    out.emplace_back(node.path, node.allOptionTokens);
++  }
++  return out;
++}
++
++ItemsByPath optionsTakingValueItemsByPath(const CompletionTree& tree)
++{
++  ItemsByPath out;
++  out.reserve(tree.nodes.size());
++  for (const auto& node: tree.nodes)
++  {
++    out.emplace_back(node.path, node.optionsTakingValue);
++  }
++  return out;
++}
++
++nlohmann::json buildSectionsContext(const CompletionTree& tree,
++                                    const VarNameFn& varNameFn,
++                                    const EscapeFn& valueEscape,
++                                    const EscapeFn& descriptionEscape)
++{
++  auto applyValue = [&](std::string_view s) -> std::string
++  { return valueEscape ? valueEscape(s) : std::string(s); };
++  auto applyDesc = [&](std::string_view s) -> std::string
++  { return descriptionEscape ? descriptionEscape(s) : std::string(s); };
++
++  nlohmann::json sections = nlohmann::json::array();
++  for (const auto& section: dataSections)
++  {
++    // Keep `sectionItems` alive for the full section body so the map below can safely hold
++    // pointers into it.
++    const auto sectionItems =
++      section.itemsGetter != nullptr ? section.itemsGetter(tree) : ItemsByPath {};
++    std::unordered_map<std::string, const std::vector<NamedEntry>*> itemsByPath;
++    for (const auto& [path, entries]: sectionItems)
++    {
++      itemsByPath.emplace(path, &entries);
++    }
++
++    nlohmann::json entries = nlohmann::json::array();
++    for (const auto& [k, v]: section.getter(tree))
++    {
++      nlohmann::json entry = {{"key", applyValue(k)}, {"value", applyValue(v)}};
++      const auto it = itemsByPath.find(k);
++      if (it != itemsByPath.end())
++      {
++        nlohmann::json items = nlohmann::json::array();
++        for (const auto& e: *it->second)
++        {
++          items.push_back({{"name", applyValue(e.name)}, {"description", applyDesc(e.description)}});
++        }
++        entry["items"] = items;
++      }
++      entries.push_back(std::move(entry));
++    }
++    sections.push_back({{"var_name", varNameFn(section.logicalName)},
++                        {"has_items", section.itemsGetter != nullptr},
++                        {"entries", entries}});
++  }
++
++  nlohmann::json ctx;
++  ctx["sections"] = sections;
++  return ctx;
++}
++
++}  // namespace completions
+diff --git a/apps/cli_gen/src/completions/completion_tree.h b/apps/cli_gen/src/completions/completion_tree.h
+new file mode 100644
+index 0000000..9e3a881
+--- /dev/null
++++ b/apps/cli_gen/src/completions/completion_tree.h
+@@ -0,0 +1,206 @@
++// === completion_tree.h ==============================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#ifndef SEN_APPS_CLI_GEN_COMPLETIONS_COMPLETION_TREE_H
++#define SEN_APPS_CLI_GEN_COMPLETIONS_COMPLETION_TREE_H
++
++// The input JSON shape consumed by this module is documented in
++// apps/cli_common/include/sen/cli/spec.h (the producer). Look there for the field list and
++// value conventions ("kind", "type_name" suffixes, etc.).
++
++// nlohmann
++#include <nlohmann/json.hpp>
++
++// std
++#include <array>
++#include <functional>
++#include <iosfwd>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++namespace completions
++{
++
++/// A completion candidate carrying both the literal token to insert and its human-readable
++/// description. Shells that support inline descriptions (zsh, fish, PowerShell) render the
++/// description alongside the candidate; bash ignores it (bash has no native description UI).
++struct NamedEntry
++{
++  std::string name;
++  std::string description;
++};
++
++struct NodeFacts
++{
++  /// Space-joined key used to index each node; e.g. "sen", "sen run", "sen gen cpp".
++  std::string path;
++
++  /// Non-deprecated subcommand names valid at this path (with their descriptions).
++  std::vector<NamedEntry> subcommands;
++
++  /// Non-deprecated option/flag tokens (long + short, with leading dashes). Each long or
++  /// short form is a separate entry carrying the same description as its owning option.
++  std::vector<NamedEntry> allOptionTokens;
++
++  /// Subset of allOptionTokens that consume a value argument.
++  std::vector<NamedEntry> optionsTakingValue;
++
++  /// CLI11 type_name of the first positional argument at this path (empty if none). Subsequent
++  /// positionals at the same node are ignored: no current sen command takes more than one
++  /// heterogeneous positional. If that changes, promote this to std::vector<std::string> and
++  /// teach the shell walker to count how many positionals have been consumed on the command
++  /// line before picking the right type.
++  std::string positionalType;
++
++  /// Choice list of the first positional (populated only when the positional was registered
++  /// via sen::cli::addChoice); empty otherwise.
++  std::vector<std::string> positionalChoices;
++};
++
++struct OptionFacts
++{
++  /// Owner node path (same key as NodeFacts::path).
++  std::string path;
++
++  /// The option token this entry describes (one of the strings in NodeFacts::optionsTakingValue).
++  std::string token;
++
++  /// CLI11 type_name of the option's value (e.g., "TEXT", "TEXT:FILE", "TEXT:DIR", "TEXT:{a,b}").
++  std::string typeName;
++
++  /// Choices registered via sen::cli::addChoice. Each entry carries a value and an optional
++  /// description; undescribed choices (registered via the string-only overload) have an empty
++  /// description.
++  std::vector<NamedEntry> choices;
++};
++
++struct CompletionTree
++{
++  std::vector<NodeFacts> nodes;
++  std::vector<OptionFacts> options;
++};
++
++/// Walks the merged spec and returns a flattened CompletionTree suitable for shell emission.
++CompletionTree buildCompletionTree(const nlohmann::json& mergedSpec);
++
++/// List of (key, value) pairs. Emitters use this shape to represent the associative data a
++/// shell needs to declare: each pair becomes one entry in a bash assoc array, zsh hash, fish
++/// switch case, or PowerShell hashtable.
++using KVList = std::vector<std::pair<std::string, std::string>>;
++
++/// Per-node list of NamedEntry candidates, keyed by node path. Description-aware shells (zsh,
++/// fish, PowerShell) pull the `items` field from the rendered context; bash ignores it and
++/// uses the space-joined KVList form instead.
++using ItemsByPath = std::vector<std::pair<std::string, std::vector<NamedEntry>>>;
++
++std::string joinSpace(const std::vector<std::string>& items);
++
++/// Maps path -> space-joined subcommand names; one entry per node.
++KVList subcommandsByPath(const CompletionTree& tree);
++
++/// Maps path -> space-joined list of all option/flag tokens (long + short, with dashes).
++KVList optionTokensByPath(const CompletionTree& tree);
++
++/// Maps path -> space-joined list of tokens that consume a value argument.
++KVList optionsTakingValueByPath(const CompletionTree& tree);
++
++/// Maps path -> positional CLI11 type_name (only for nodes that have a positional).
++KVList positionalTypesByPath(const CompletionTree& tree);
++
++/// Maps path -> space-joined choice list for the positional (only for positionals with choices).
++KVList positionalChoicesByPath(const CompletionTree& tree);
++
++/// Maps "path|token" -> CLI11 type_name of the option's value.
++KVList optionTypesByKey(const CompletionTree& tree);
++
++/// Maps "path|token" -> space-joined choice list (empty for non-choice options).
++KVList optionChoicesByKey(const CompletionTree& tree);
++
++/// Per-node subcommand candidates with descriptions, keyed by node path.
++ItemsByPath subcommandItemsByPath(const CompletionTree& tree);
++
++/// Per-node option/flag tokens with descriptions, keyed by node path.
++ItemsByPath optionTokenItemsByPath(const CompletionTree& tree);
++
++/// Per-node value-consuming option tokens with descriptions, keyed by node path.
++ItemsByPath optionsTakingValueItemsByPath(const CompletionTree& tree);
++
++/// Per-option choice lists with descriptions, keyed by "path|token". Used by shells that
++/// render descriptions alongside a `--flag <TAB>` value-list completion.
++ItemsByPath optionChoiceItemsByKey(const CompletionTree& tree);
++
++/// Registry entry for a single data section that emitters declare in their output script.
++/// Each shell emitter iterates dataSections, derives its shell-specific variable name from
++/// logicalName, and invokes getter(tree) to get the KVList to encode. For sections whose
++/// candidates carry descriptions (subcommands, options), itemsGetter returns the name/
++/// description pairs that description-aware shells embed alongside each candidate; null
++/// means the section has no descriptions (e.g., positional file types, choice lists).
++/// Adding a new data section requires appending one entry here plus referencing it from each
++/// shell's walker.
++struct DataSection
++{
++  const char* logicalName;
++  KVList (*getter)(const CompletionTree&);
++  ItemsByPath (*itemsGetter)(const CompletionTree&);
++};
++
++inline constexpr std::array<DataSection, 7> dataSections = {{
++  {"subs", subcommandsByPath, subcommandItemsByPath},
++  {"opts", optionTokensByPath, optionTokenItemsByPath},
++  {"opts_val", optionsTakingValueByPath, optionsTakingValueItemsByPath},
++  {"positional_type", positionalTypesByPath, nullptr},
++  {"positional_choices", positionalChoicesByPath, nullptr},
++  {"option_type", optionTypesByKey, nullptr},
++  {"option_choices", optionChoicesByKey, optionChoiceItemsByKey},
++}};
++
++using VarNameFn = std::function<std::string(const char* logicalName)>;
++using EscapeFn = std::function<std::string(std::string_view)>;
++
++/// Builds the inja context shared by every shell template. Each section's `entries` array
++/// carries both a space-joined `value` (for bash) and an `items` array of `{name, description}`
++/// pairs (for shells that render per-candidate descriptions). Escape callbacks adjust keys,
++/// values, and descriptions for shell-specific quoting rules; when null, no escaping is applied.
++///
++///   { "sections": [
++///       {
++///         "var_name": "_sen_subs",
++///         "entries": [
++///           {
++///             "key":   "sen",
++///             "value": "run generate archive",
++///             "items": [ {"name": "run", "description": "Run a sen kernel"}, ... ]
++///           }
++///         ]
++///       }
++///   ] }
++nlohmann::json buildSectionsContext(const CompletionTree& tree,
++                                    const VarNameFn& varNameFn,
++                                    const EscapeFn& valueEscape = nullptr,
++                                    const EscapeFn& descriptionEscape = nullptr);
++
++// --------------------------------------------------------------------------------------------
++// Emission entry point
++// --------------------------------------------------------------------------------------------
++
++enum class Shell
++{
++  bash,
++  zsh,
++  fish,
++  powershell
++};
++
++/// Renders the completion script for the given shell from the merged CLI spec. The output is a
++/// self-contained, sourceable script; no runtime `sen __complete` callback is involved.
++void emit(Shell shell, const nlohmann::json& mergedSpec, std::ostream& out);
++
++}  // namespace completions
++
++#endif  // SEN_APPS_CLI_GEN_COMPLETIONS_COMPLETION_TREE_H
+diff --git a/apps/cli_gen/src/completions/completions_generator.cpp b/apps/cli_gen/src/completions/completions_generator.cpp
+new file mode 100644
+index 0000000..a313699
+--- /dev/null
++++ b/apps/cli_gen/src/completions/completions_generator.cpp
+@@ -0,0 +1,93 @@
++// === completions_generator.cpp ======================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#include "completions_generator.h"
++
++// app
++#include "completion_tree.h"
++#include "spec_merge.h"
++
++// nlohmann
++#include <nlohmann/json.hpp>
++
++// std
++#include <filesystem>
++#include <fstream>
++#include <memory>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace
++{
++
++struct Args
++{
++  std::vector<std::filesystem::path> specFiles;
++  std::filesystem::path outDir;
++};
++
++nlohmann::json readJsonFile(const std::filesystem::path& path)
++{
++  std::ifstream file(path);
++  if (!file.is_open())
++  {
++    throw std::runtime_error("completions: cannot open spec file: " + path.string());
++  }
++  nlohmann::json j;
++  file >> j;
++  return j;
++}
++
++void writeScript(const std::filesystem::path& outDir,
++                 const std::string& fileName,
++                 completions::Shell shell,
++                 const nlohmann::json& merged)
++{
++  std::filesystem::create_directories(outDir);
++  const auto outPath = outDir / fileName;
++  std::ofstream out(outPath);
++  if (!out.is_open())
++  {
++    throw std::runtime_error("completions: cannot write " + outPath.string());
++  }
++  completions::emit(shell, merged, out);
++}
++
++}  // namespace
++
++void CompletionsGenerator::setup(CLI::App& app)
++{
++  auto args = std::make_shared<Args>();
++  // Invoked only by Sen's CMake tooling (see apps/cli_gen/CMakeLists.txt) to render the shell
++  // scripts at build time. Hidden from --help and completion; real users install completions
++  // via 'sen completion <shell>' instead.
++  auto cmd = app.add_subcommand("completions", "Render shell completion scripts from per-binary specs");
++  cmd->group("");
++  cmd->add_option("--spec", args->specFiles, "CLI spec JSON file (repeatable)")
++    ->required()
++    ->check(CLI::ExistingFile);
++  cmd->add_option("--out-dir", args->outDir, "Directory to write completion scripts into")->required();
++
++  cmd->callback(
++    [args]()
++    {
++      std::vector<nlohmann::json> specs;
++      specs.reserve(args->specFiles.size());
++      for (const auto& path: args->specFiles)
++      {
++        specs.push_back(readJsonFile(path));
++      }
++
++      const auto merged = completions::mergeSpecs(specs);
++
++      writeScript(args->outDir, "sen.bash", completions::Shell::bash, merged);
++      writeScript(args->outDir, "_sen", completions::Shell::zsh, merged);
++      writeScript(args->outDir, "sen.fish", completions::Shell::fish, merged);
++      writeScript(args->outDir, "sen.ps1", completions::Shell::powershell, merged);
++    });
++}
+diff --git a/apps/cli_gen/src/completions/completions_generator.h b/apps/cli_gen/src/completions/completions_generator.h
+new file mode 100644
+index 0000000..c5f1252
+--- /dev/null
++++ b/apps/cli_gen/src/completions/completions_generator.h
+@@ -0,0 +1,20 @@
++// === completions_generator.h ========================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#ifndef SEN_APPS_CLI_GEN_COMPLETIONS_GENERATOR_H
++#define SEN_APPS_CLI_GEN_COMPLETIONS_GENERATOR_H
++
++// cli11
++#include <CLI/App.hpp>
++
++class CompletionsGenerator
++{
++public:
++  static void setup(CLI::App& app);
++};
++
++#endif  // SEN_APPS_CLI_GEN_COMPLETIONS_GENERATOR_H
+diff --git a/apps/cli_gen/src/completions/emitters.cpp b/apps/cli_gen/src/completions/emitters.cpp
+new file mode 100644
+index 0000000..c18d679
+--- /dev/null
++++ b/apps/cli_gen/src/completions/emitters.cpp
+@@ -0,0 +1,141 @@
++// === emitters.cpp ===================================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#include "completion_tree.h"
++
++// generated code
++#include "completions_templates/bash.h"
++#include "completions_templates/fish.h"
++#include "completions_templates/powershell.h"
++#include "completions_templates/zsh.h"
++
++// sen
++#include "sen/core/base/compiler_macros.h"
++#include "sen/core/base/hash32.h"
++#include "sen/core/base/string_case.h"
++
++// inja
++#include <inja/environment.hpp>
++
++// std
++#include <string>
++#include <string_view>
++
++namespace completions
++{
++
++namespace
++{
++
++/// PowerShell single-quoted strings escape an embedded apostrophe by doubling it.
++std::string escapeSingleQuotes(std::string_view s)
++{
++  std::string out;
++  out.reserve(s.size());
++  for (auto c: s)
++  {
++    if (c == '\'')
++    {
++      out.append("''");
++    }
++    else
++    {
++      out.push_back(c);
++    }
++  }
++  return out;
++}
++
++/// zsh's _describe parses each element as "name:description"; a raw ':' or '\\' inside the
++/// description confuses the parser. Escape both.
++std::string escapeZshDescription(std::string_view s)
++{
++  std::string out;
++  out.reserve(s.size());
++  for (auto c: s)
++  {
++    if (c == '\\' || c == ':')
++    {
++      out.push_back('\\');
++    }
++    out.push_back(c);
++  }
++  return out;
++}
++
++/// The PowerShell templates embed descriptions inside 'name|description' single-quoted array
++/// entries, so '|' is reserved as the separator. Also escape single quotes (doubled).
++std::string escapePowerShellDescription(std::string_view s)
++{
++  std::string out;
++  out.reserve(s.size());
++  for (auto c: s)
++  {
++    if (c == '\'')
++    {
++      out.append("''");
++    }
++    else if (c == '|')
++    {
++      // Unlikely in Sen descriptions today; guard anyway. A backslash would also work; we pick
++      // a visible replacement so the problem is spotted if a description ever introduces '|'.
++      out.push_back('/');
++    }
++    else
++    {
++      out.push_back(c);
++    }
++  }
++  return out;
++}
++
++struct ShellConfig
++{
++  const unsigned* templateData;
++  unsigned templateSize;
++  VarNameFn varName;
++  EscapeFn valueEscape;
++  EscapeFn descriptionEscape;
++};
++
++ShellConfig configFor(Shell shell)
++{
++  switch (shell)
++  {
++    case Shell::bash:
++      return {bash, bashSize,
++              [](const char* n) { return std::string("_sen_") + n; },
++              nullptr, nullptr};
++    case Shell::zsh:
++      return {zsh, zshSize,
++              [](const char* n) { return std::string("_sen_") + n; },
++              nullptr, escapeZshDescription};
++    case Shell::fish:
++      return {fish, fishSize,
++              [](const char* n) { return std::string("__sen_") + n; },
++              nullptr, nullptr};
++    case Shell::powershell:
++      return {powershell, powershellSize,
++              [](const char* n) { return "Sen" + sen::toPascalCase(n); },
++              escapeSingleQuotes, escapePowerShellDescription};
++  }
++  SEN_UNREACHABLE();
++}
++
++}  // namespace
++
++void emit(Shell shell, const nlohmann::json& mergedSpec, std::ostream& out)
++{
++  const auto tree = buildCompletionTree(mergedSpec);
++  const auto cfg = configFor(shell);
++  const auto ctx = buildSectionsContext(tree, cfg.varName, cfg.valueEscape, cfg.descriptionEscape);
++
++  inja::Environment env;
++  out << env.render(sen::decompressSymbolToString(cfg.templateData, cfg.templateSize), ctx);
++}
++
++}  // namespace completions
+diff --git a/apps/cli_gen/src/completions/spec_merge.cpp b/apps/cli_gen/src/completions/spec_merge.cpp
+new file mode 100644
+index 0000000..3dab191
+--- /dev/null
++++ b/apps/cli_gen/src/completions/spec_merge.cpp
+@@ -0,0 +1,100 @@
++// === spec_merge.cpp =================================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#include "spec_merge.h"
++
++// nlohmann
++#include <nlohmann/json.hpp>
++
++// std
++#include <cstddef>
++#include <stdexcept>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace completions
++{
++
++namespace
++{
++
++nlohmann::json* findSubcommand(nlohmann::json& parent, std::string_view name)
++{
++  if (!parent.contains("subcommands"))
++  {
++    return nullptr;
++  }
++  for (auto& sub: parent["subcommands"])
++  {
++    if (sub.value("name", "") == name)
++    {
++      return &sub;
++    }
++  }
++  return nullptr;
++}
++
++void graftChildSpec(nlohmann::json& root, const nlohmann::json& childSpec)
++{
++  const std::vector<std::string> path = childSpec.value("path", std::vector<std::string> {});
++  if (path.size() <= 1U)
++  {
++    return;  // childSpec IS the root (e.g. cli_sen); handled by mergeSpecs before this call.
++  }
++
++  nlohmann::json* node = &root;
++  for (std::size_t i = 1; i < path.size(); ++i)
++  {
++    auto* next = findSubcommand(*node, path[i]);
++    if (next == nullptr)
++    {
++      return;  // no matching slot; silently ignore (e.g. deprecated or unknown binary)
++    }
++    node = next;
++  }
++
++  for (const auto& key: {"options", "subcommands", "allow_extras", "require_subcommand"})
++  {
++    if (childSpec.contains(key))
++    {
++      (*node)[key] = childSpec[key];
++    }
++  }
++}
++
++}  // namespace
++
++nlohmann::json mergeSpecs(const std::vector<nlohmann::json>& specs)
++{
++  const nlohmann::json* rootSpec = nullptr;
++  for (const auto& spec: specs)
++  {
++    if (spec.value("name", "") == "sen")
++    {
++      rootSpec = &spec;
++      break;
++    }
++  }
++  if (rootSpec == nullptr)
++  {
++    throw std::runtime_error("completions: no spec with name 'sen' found (cli_sen spec is required)");
++  }
++
++  nlohmann::json merged = *rootSpec;
++  for (const auto& spec: specs)
++  {
++    if (&spec == rootSpec)
++    {
++      continue;
++    }
++    graftChildSpec(merged, spec);
++  }
++  return merged;
++}
++
++}  // namespace completions
+diff --git a/apps/cli_gen/src/completions/spec_merge.h b/apps/cli_gen/src/completions/spec_merge.h
+new file mode 100644
+index 0000000..6efe7f9
+--- /dev/null
++++ b/apps/cli_gen/src/completions/spec_merge.h
+@@ -0,0 +1,34 @@
++// === spec_merge.h ===================================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#ifndef SEN_APPS_CLI_GEN_COMPLETIONS_SPEC_MERGE_H
++#define SEN_APPS_CLI_GEN_COMPLETIONS_SPEC_MERGE_H
++
++// The input JSON shape operated on by mergeSpecs is documented in
++// apps/cli_common/include/sen/cli/spec.h (the producer).
++
++// nlohmann
++#include <nlohmann/json.hpp>
++
++// std
++#include <vector>
++
++namespace completions
++{
++
++/// Builds the merged spec tree from the per-binary specs. The root of the merged tree is the
++/// spec whose name is "sen" (i.e. cli_sen's dump). Every other spec is grafted into the root's
++/// subcommand hierarchy at the location indicated by its "path" array: for a spec with
++/// path=["sen","run"], root.subcommands[name=="run"] has its options and subcommand list
++/// replaced with that spec's.
++///
++/// Throws std::runtime_error if the "sen" root spec is not present in the input.
++nlohmann::json mergeSpecs(const std::vector<nlohmann::json>& specs);
++
++}  // namespace completions
++
++#endif  // SEN_APPS_CLI_GEN_COMPLETIONS_SPEC_MERGE_H
+diff --git a/apps/cli_gen/src/completions/templates/bash.j2 b/apps/cli_gen/src/completions/templates/bash.j2
+new file mode 100644
+index 0000000..f6cd6cc
+--- /dev/null
++++ b/apps/cli_gen/src/completions/templates/bash.j2
+@@ -0,0 +1,117 @@
++# sen completion for bash (requires bash >= 4)
++# Generated by 'sen gen completions'. Do not edit by hand.
++
++## for section in sections
++declare -A {{ section.var_name }}=(
++## for entry in section.entries
++  ["{{ entry.key }}"]="{{ entry.value }}"
++## endfor
++)
++
++## endfor
++_sen_complete_by_type() {
++  local type=$1
++  local cur=$2
++  if [[ "$type" == *":DIR"* ]]; then
++    COMPREPLY+=( $(compgen -d -- "$cur") )
++  elif [[ "$type" == *":FILE"* ]] || [[ "$type" == *":PATH(existing)"* ]] || [[ "$type" == *":PATH"* ]]; then
++    COMPREPLY+=( $(compgen -f -- "$cur") )
++  fi
++}
++
++# Emit option/flag candidates for the given path, filtering out any flag that has already
++# been typed. Value-taking options (opts_val) are never filtered because they may repeat
++# (e.g. '-i path1 -i path2'); even single-value options are safe to re-offer.
++_sen_emit_opts() {
++  local path="$1"
++  local cur="$2"
++  local typed=" $3 "
++  local all="${_sen_opts[$path]}"
++  [[ -z "$all" ]] && return
++  local filtered=""
++  for name in $all; do
++    if [[ "$typed" != *" $name "* ]]; then
++      filtered="$filtered $name"
++    fi
++  done
++  COMPREPLY+=( $(compgen -W "$filtered" -- "$cur") )
++}
++
++_sen_complete() {
++  local cword=$COMP_CWORD
++  local cur="${COMP_WORDS[cword]}"
++  local prev=""
++  if (( cword > 0 )); then
++    prev="${COMP_WORDS[cword-1]}"
++  fi
++
++  local path="sen"
++  local i=1
++  while (( i < cword )); do
++    local w="${COMP_WORDS[i]}"
++    if [[ "$w" == -* ]]; then
++      local vlist="${_sen_opts_val[$path]}"
++      if [[ " $vlist " == *" $w "* ]]; then
++        (( i++ ))
++      fi
++      (( i++ ))
++      continue
++    fi
++    local subs="${_sen_subs[$path]}"
++    if [[ " $subs " == *" $w "* ]]; then
++      path="$path $w"
++    fi
++    (( i++ ))
++  done
++
++  # Collect already-typed flags (non-value-taking tokens) so _sen_emit_opts can filter them.
++  local typed_flags=""
++  local vlist_here="${_sen_opts_val[$path]}"
++  local k=1
++  while (( k < cword )); do
++    local tok="${COMP_WORDS[k]}"
++    if [[ "$tok" == -* ]] && [[ " $vlist_here " != *" $tok "* ]]; then
++      typed_flags="$typed_flags $tok"
++    fi
++    (( k++ ))
++  done
++
++  COMPREPLY=()
++
++  if [[ "$prev" == -* ]]; then
++    local vlist="${_sen_opts_val[$path]}"
++    if [[ " $vlist " == *" $prev "* ]]; then
++      local key="$path|$prev"
++      local choices="${_sen_option_choices[$key]}"
++      if [[ -n "$choices" ]]; then
++        COMPREPLY=( $(compgen -W "$choices" -- "$cur") )
++      else
++        _sen_complete_by_type "${_sen_option_type[$key]}" "$cur"
++      fi
++      return
++    fi
++  fi
++
++  if [[ "$cur" == -* ]]; then
++    _sen_emit_opts "$path" "$cur" "$typed_flags"
++    return
++  fi
++
++  local subs="${_sen_subs[$path]}"
++  if [[ -n "$subs" ]]; then
++    COMPREPLY+=( $(compgen -W "$subs" -- "$cur") )
++  fi
++  local pchoices="${_sen_positional_choices[$path]}"
++  if [[ -n "$pchoices" ]]; then
++    COMPREPLY+=( $(compgen -W "$pchoices" -- "$cur") )
++  fi
++  local ptype="${_sen_positional_type[$path]}"
++  if [[ -n "$ptype" ]]; then
++    _sen_complete_by_type "$ptype" "$cur"
++  fi
++  # Also offer flags alongside subcommands/positional; sen's flag surface is small enough
++  # that flags do not drown out other candidates.
++  _sen_emit_opts "$path" "$cur" "$typed_flags"
++}
++
++complete -F _sen_complete sen
+diff --git a/apps/cli_gen/src/completions/templates/fish.j2 b/apps/cli_gen/src/completions/templates/fish.j2
+new file mode 100644
+index 0000000..1370925
+--- /dev/null
++++ b/apps/cli_gen/src/completions/templates/fish.j2
+@@ -0,0 +1,128 @@
++# sen completion for fish
++# Generated by 'sen gen completions'. Do not edit by hand.
++
++## for section in sections
++function {{ section.var_name }}
++    switch $argv[1]
++## for entry in section.entries
++        case '{{ entry.key }}'
++            echo '{{ entry.value }}'
++## endfor
++    end
++end
++
++## if section.has_items
++function {{ section.var_name }}_desc
++    switch $argv[1]
++## for entry in section.entries
++        case '{{ entry.key }}'
++## for item in entry.items
++            printf '%s\t%s\n' '{{ item.name }}' '{{ item.description }}'
++## endfor
++## endfor
++    end
++end
++
++## endif
++## endfor
++function __sen_complete_by_type
++    set -l type $argv[1]
++    set -l cur $argv[2]
++    if string match -q '*:DIR*' -- $type
++        __fish_complete_directories $cur
++    else if string match -q '*:FILE*' -- $type; or string match -q '*:PATH*' -- $type
++        __fish_complete_path $cur
++    end
++end
++
++# Emit option/flag candidates for the given path, filtering out any flag that has already
++# been typed. Value-taking options (opts_val) are never filtered because they may repeat
++# (e.g. '-i path1 -i path2'); even single-value options are safe to re-offer.
++function __sen_emit_opts
++    set -l path $argv[1]
++    set -l typed " $argv[2] "
++    for line in (__sen_opts_desc "$path")
++        set -l name (string split -m 1 \t -- $line)[1]
++        if not string match -q -- "* $name *" "$typed"
++            echo $line
++        end
++    end
++end
++
++function __sen_complete
++    set -l cmd (commandline -opc)
++    set -l cur (commandline -ct)
++    set -l cmd_count (count $cmd)
++
++    set -l path "sen"
++    set -l i 2
++    while test $i -le $cmd_count
++        set -l w $cmd[$i]
++        if string match -q -- '-*' $w
++            set -l vlist (__sen_opts_val "$path")
++            if string match -q -- "* $w *" " $vlist "
++                set i (math $i + 1)
++            end
++            set i (math $i + 1)
++            continue
++        end
++        set -l subs (__sen_subs "$path")
++        if string match -q -- "* $w *" " $subs "
++            set path "$path $w"
++        end
++        set i (math $i + 1)
++    end
++
++    # Collect already-typed flags at the resolved path so __sen_emit_opts can filter them.
++    set -l typed_flags ""
++    set -l vlist_here (__sen_opts_val "$path")
++    set -l k 2
++    while test $k -le $cmd_count
++        set -l tok $cmd[$k]
++        if string match -q -- '-*' $tok
++            if not string match -q -- "* $tok *" " $vlist_here "
++                set typed_flags "$typed_flags $tok"
++            end
++        end
++        set k (math $k + 1)
++    end
++
++    set -l prev ""
++    if test $cmd_count -ge 2
++        set prev $cmd[$cmd_count]
++    end
++
++    if string match -q -- '-*' $prev
++        set -l vlist (__sen_opts_val "$path")
++        if string match -q -- "* $prev *" " $vlist "
++            set -l key "$path|$prev"
++            set -l choices (__sen_option_choices "$key")
++            if test -n "$choices"
++                __sen_option_choices_desc "$key"
++            else
++                __sen_complete_by_type (__sen_option_type "$key") $cur
++            end
++            return
++        end
++    end
++
++    if string match -q -- '-*' $cur
++        __sen_emit_opts "$path" "$typed_flags"
++        return
++    end
++
++    __sen_subs_desc "$path"
++    set -l pchoices (__sen_positional_choices "$path")
++    for c in (string split ' ' -- $pchoices)
++        test -n "$c"; and echo $c
++    end
++    set -l ptype (__sen_positional_type "$path")
++    if test -n "$ptype"
++        __sen_complete_by_type $ptype $cur
++    end
++    # Also offer flags alongside subcommands/positional; sen's flag surface is small enough
++    # that flags do not drown out other candidates.
++    __sen_emit_opts "$path" "$typed_flags"
++end
++
++complete -c sen -f -a '(__sen_complete)'
+diff --git a/apps/cli_gen/src/completions/templates/powershell.j2 b/apps/cli_gen/src/completions/templates/powershell.j2
+new file mode 100644
+index 0000000..3482b03
+--- /dev/null
++++ b/apps/cli_gen/src/completions/templates/powershell.j2
+@@ -0,0 +1,132 @@
++# sen completion for PowerShell
++# Generated by 'sen gen completions'. Do not edit by hand.
++
++## for section in sections
++$script:{{ section.var_name }} = @{
++## for entry in section.entries
++  '{{ entry.key }}' = '{{ entry.value }}'
++## endfor
++}
++
++## if section.has_items
++$script:{{ section.var_name }}Desc = @{
++## for entry in section.entries
++  '{{ entry.key }}' = @(
++## for item in entry.items
++    '{{ item.name }}|{{ item.description }}'
++## endfor
++  )
++## endfor
++}
++
++## endif
++## endfor
++function Get-SenCompleteByType {
++    param($Type, $WordToComplete)
++    $results = @()
++    if ($Type -match ':DIR') {
++        $results = Get-ChildItem -Directory -Name "$WordToComplete*" -ErrorAction SilentlyContinue
++    }
++    elseif ($Type -match ':FILE' -or $Type -match ':PATH') {
++        $results = Get-ChildItem -Name "$WordToComplete*" -ErrorAction SilentlyContinue
++    }
++    foreach ($r in $results) {
++        [System.Management.Automation.CompletionResult]::new($r, $r, 'ProviderItem', $r)
++    }
++}
++
++function Emit-SenCandidates {
++    param($Items, $WordToComplete, $ResultType, $TypedFlags = '')
++    $typedPadded = " $TypedFlags "
++    foreach ($item in $Items) {
++        $parts = $item -split '\|', 2
++        $name = $parts[0]
++        if ($typedPadded.Contains(" $name ")) { continue }
++        $desc = if ($parts.Count -gt 1) { $parts[1] } else { $name }
++        if ($name -and $name.StartsWith($WordToComplete)) {
++            [System.Management.Automation.CompletionResult]::new($name, $name, $ResultType, $desc)
++        }
++    }
++}
++
++Register-ArgumentCompleter -Native -CommandName sen -ScriptBlock {
++    param($wordToComplete, $commandAst, $cursorPosition)
++
++    $words = @($commandAst.CommandElements | ForEach-Object { $_.ToString() })
++    $endsWithSpace = $cursorPosition -gt $commandAst.Extent.EndOffset
++
++    $path = 'sen'
++    $i = 1
++    $limit = $words.Count
++    if (-not $endsWithSpace) { $limit = $words.Count - 1 }
++    while ($i -lt $limit) {
++        $w = $words[$i]
++        if ($w.StartsWith('-')) {
++            $vlist = $script:SenOptsVal[$path]
++            if ($vlist -and (" $vlist ").Contains(" $w ")) { $i++ }
++            $i++
++            continue
++        }
++        $subs = $script:SenSubs[$path]
++        if ($subs -and (" $subs ").Contains(" $w ")) {
++            $path = "$path $w"
++        }
++        $i++
++    }
++
++    # Collect already-typed flags at the resolved path so flag suggestions can filter them.
++    # Value-taking options (present in SenOptsVal) are never tracked because they may repeat.
++    $typedFlags = ''
++    $vlistHere = $script:SenOptsVal[$path]
++    $m = 1
++    while ($m -lt $limit) {
++        $tok = $words[$m]
++        if ($tok.StartsWith('-') -and -not (" $vlistHere ").Contains(" $tok ")) {
++            $typedFlags = "$typedFlags $tok"
++        }
++        $m++
++    }
++
++    $prev = ''
++    if ($words.Count -ge 2) {
++        $prev = $words[$words.Count - 2]
++        if ($endsWithSpace) { $prev = $words[$words.Count - 1] }
++    }
++
++    if ($prev.StartsWith('-')) {
++        $vlist = $script:SenOptsVal[$path]
++        if ($vlist -and (" $vlist ").Contains(" $prev ")) {
++            $key = "$path|$prev"
++            $choices = $script:SenOptionChoices[$key]
++            if ($choices) {
++                Emit-SenCandidates $script:SenOptionChoicesDesc[$key] $wordToComplete 'ParameterValue'
++                return
++            }
++            Get-SenCompleteByType $script:SenOptionType[$key] $wordToComplete
++            return
++        }
++    }
++
++    if ($wordToComplete.StartsWith('-')) {
++        Emit-SenCandidates $script:SenOptsDesc[$path] $wordToComplete 'ParameterName' $typedFlags
++        return
++    }
++
++    Emit-SenCandidates $script:SenSubsDesc[$path] $wordToComplete 'Command'
++
++    $pchoices = $script:SenPositionalChoices[$path]
++    if ($pchoices) {
++        foreach ($c in ($pchoices -split ' ')) {
++            if ($c -and $c.StartsWith($wordToComplete)) {
++                [System.Management.Automation.CompletionResult]::new($c, $c, 'ParameterValue', $c)
++            }
++        }
++    }
++    $ptype = $script:SenPositionalType[$path]
++    if ($ptype) {
++        Get-SenCompleteByType $ptype $wordToComplete
++    }
++    # Also offer flags alongside subcommands/positional; sen's flag surface is small enough
++    # that flags do not drown out other candidates.
++    Emit-SenCandidates $script:SenOptsDesc[$path] $wordToComplete 'ParameterName' $typedFlags
++}
+diff --git a/apps/cli_gen/src/completions/templates/zsh.j2 b/apps/cli_gen/src/completions/templates/zsh.j2
+new file mode 100644
+index 0000000..e91d4f9
+--- /dev/null
++++ b/apps/cli_gen/src/completions/templates/zsh.j2
+@@ -0,0 +1,128 @@
++#compdef sen
++# sen completion for zsh
++# Generated by 'sen gen completions'. Do not edit by hand.
++
++## for section in sections
++typeset -gA {{ section.var_name }}=(
++## for entry in section.entries
++  "{{ entry.key }}" "{{ entry.value }}"
++## endfor
++)
++
++## if section.has_items
++typeset -gA {{ section.var_name }}_desc=(
++## for entry in section.entries
++  "{{ entry.key }}" $'{% for item in entry.items %}{% if not loop.is_first %}\n{% endif %}{{ item.name }}:{{ item.description }}{% endfor %}'
++## endfor
++)
++
++## endif
++## endfor
++_sen_complete_by_type() {
++  local type=$1
++  if [[ "$type" == *":DIR"* ]]; then
++    _files -/
++  elif [[ "$type" == *":FILE"* ]] || [[ "$type" == *":PATH(existing)"* ]] || [[ "$type" == *":PATH"* ]]; then
++    _files
++  fi
++}
++
++# Emit option/flag candidates for the given path, filtering out any flag that the user already
++# typed. Value-taking options (opts_val) are never filtered; they may legitimately repeat
++# (e.g., '-i path1 -i path2'), and even single-value options do no harm when re-offered.
++_sen_emit_opts() {
++  local path="$1"
++  local typed=" $2 "
++  local raw="${_sen_opts_desc[$path]}"
++  [[ -z "$raw" ]] && return
++  local -a opts
++  opts=()
++  local line name
++  for line in "${(@f)raw}"; do
++    name="${line%%:*}"
++    if [[ "$typed" != *" $name "* ]]; then
++      opts+=("$line")
++    fi
++  done
++  _describe -V 'option' opts
++}
++
++_sen() {
++  local path="sen"
++  local i=2
++  while (( i < CURRENT )); do
++    local w="${words[i]}"
++    if [[ "$w" == -* ]]; then
++      local vlist="${_sen_opts_val[$path]}"
++      if [[ " $vlist " == *" $w "* ]]; then
++        (( i++ ))
++      fi
++      (( i++ ))
++      continue
++    fi
++    local subs="${_sen_subs[$path]}"
++    if [[ " $subs " == *" $w "* ]]; then
++      path="$path $w"
++    fi
++    (( i++ ))
++  done
++
++  # Collect already-typed flags at the resolved path so we can filter them from suggestions.
++  # Only non-value-taking tokens are tracked; value-taking options may legitimately repeat.
++  local typed_flags=""
++  local vlist="${_sen_opts_val[$path]}"
++  local k=2
++  while (( k < CURRENT )); do
++    local tok="${words[k]}"
++    if [[ "$tok" == -* ]] && [[ " $vlist " != *" $tok "* ]]; then
++      typed_flags="$typed_flags $tok"
++    fi
++    (( k++ ))
++  done
++
++  local cur="${words[CURRENT]}"
++  local prev=""
++  if (( CURRENT > 1 )); then
++    prev="${words[CURRENT-1]}"
++  fi
++
++  if [[ "$prev" == -* ]]; then
++    local vlist="${_sen_opts_val[$path]}"
++    if [[ " $vlist " == *" $prev "* ]]; then
++      local key="$path|$prev"
++      if [[ -n "${_sen_option_choices[$key]}" ]]; then
++        local -a choice_items
++        choice_items=("${(@f)_sen_option_choices_desc[$key]}")
++        _describe -V 'value' choice_items
++      else
++        _sen_complete_by_type "${_sen_option_type[$key]}"
++      fi
++      return
++    fi
++  fi
++
++  if [[ "$cur" == -* ]]; then
++    _sen_emit_opts "$path" "$typed_flags"
++    return
++  fi
++
++  local subs_raw="${_sen_subs_desc[$path]}"
++  if [[ -n "$subs_raw" ]]; then
++    local -a subs
++    subs=("${(@f)subs_raw}")
++    _describe -V 'subcommand' subs
++  fi
++  local pchoices="${_sen_positional_choices[$path]}"
++  if [[ -n "$pchoices" ]]; then
++    compadd -- ${=pchoices}
++  fi
++  local ptype="${_sen_positional_type[$path]}"
++  if [[ -n "$ptype" ]]; then
++    _sen_complete_by_type "$ptype"
++  fi
++  # Also offer flags even when the user has not typed a leading dash. sen's command surface is
++  # small enough that flags do not drown out subcommand/positional candidates.
++  _sen_emit_opts "$path" "$typed_flags"
++}
++
++compdef _sen sen
+diff --git a/apps/cli_gen/src/cpp/cpp_generator.cpp b/apps/cli_gen/src/cpp/cpp_generator.cpp
+index 1e90554..904f5b0 100644
+--- a/apps/cli_gen/src/cpp/cpp_generator.cpp
++++ b/apps/cli_gen/src/cpp/cpp_generator.cpp
+@@ -118,6 +118,21 @@ private:
+   std::string result_;
+ };
+ 
++void configureExportsCommand(CLI::App* cmd)
++{
++  auto args = std::make_shared<Args>();
++  cmd->add_option("-p, --package", args->packageName, "Name of the package to create the exports for");
++  cmd->add_option("-f, --file", args->stlFiles, "Name of the STL file containing types");
++  cmd->add_option("-d, --depends", args->dependentPackages, "Names of the packages we depend on");
++  cmd->add_option("-i, --implements", args->userTypes, "Names of types implemented in this package");
++  cmd->callback(
++    [args]()
++    {
++      CppGenerator::generatePackageExportsFile(
++        args->packageName, args->stlFiles, args->dependentPackages, args->userTypes);
++    });
++}
++
+ }  // namespace
+ 
+ class CppGenerator::Impl
+@@ -383,12 +398,12 @@ void CppGenerator::setup(CLI::App& app)
+ {
+   auto cppExtraArgs = std::make_shared<CppExtraArgs>();
+ 
+-  auto cpp = app.add_subcommand("cpp", "Generates C++ code");
++  auto cpp = app.add_subcommand("cpp", "Generate C++ code");
+   cpp->allow_extras();
+   cpp->require_subcommand();
+ 
+-  cpp->add_option("-r, --recursive", cppExtraArgs->recursive, "recursively generate imported packages");
+-  cpp->add_flag("--public-symbols", cppExtraArgs->publicSymbols, "make generated classes public");
++  cpp->add_option("-r, --recursive", cppExtraArgs->recursive, "Recursively generate imported packages");
++  cpp->add_flag("--public-symbols", cppExtraArgs->publicSymbols, "Make generated classes public");
+ 
+   auto stl = setupStlInput(*cpp,
+                            [cppExtraArgs](auto args)
+@@ -419,21 +434,19 @@ void CppGenerator::setup(CLI::App& app)
+                              }
+                            });
+ 
++  // Canonical location for the exports command is under 'cpp', next to 'stl' and 'fom'.
++  auto exports = cpp->add_subcommand("exports", "Generate the export symbols file for a sen STL package");
++  configureExportsCommand(exports);
++
+   stl->excludes(fom);
+ }
+ 
+ void CppGenerator::exportsSetup(CLI::App& app)
+ {
+-  auto args = std::make_shared<Args>();
+-  auto exp = app.add_subcommand("exp_package", "generates exports symbols for a sen STL package");
+-  exp->add_option("-p, --package", args->packageName, "name of the package to create the exports");
+-  exp->add_option("-f, --file", args->stlFiles, "name of the stl file containing types");
+-  exp->add_option("-d, --depends", args->dependentPackages, "name of the packages we depend on");
+-  exp->add_option("-i, --implements", args->userTypes, "name of types implemented in this package");
+-  exp->callback(
+-    [args]()
+-    {
+-      CppGenerator::generatePackageExportsFile(
+-        args->packageName, args->stlFiles, args->dependentPackages, args->userTypes);
+-    });
++  // Hidden backward-compat alias for 'generate cpp exports'. Kept so existing CMake tooling
++  // that invokes 'cli_gen exp_package ...' continues to work. The empty group hides it from
++  // --help and marks it deprecated in the spec so completion scripts skip it.
++  auto exp = app.add_subcommand("exp_package", "Alias for 'generate cpp exports'");
++  exp->group("");
++  configureExportsCommand(exp);
+ }
+diff --git a/apps/cli_gen/src/json/json_generator.cpp b/apps/cli_gen/src/json/json_generator.cpp
+index 75e4585..e477f73 100644
+--- a/apps/cli_gen/src/json/json_generator.cpp
++++ b/apps/cli_gen/src/json/json_generator.cpp
+@@ -137,14 +137,14 @@ private:
+ 
+ void setupJsonPackageArgs(CLI::App& app, JsonPackageArgs& args)
+ {
+-  app.add_option("-o, --output", args.outFile, "output file");
++  app.add_option("-o, --output", args.outFile, "Output file");
+   app.add_option("-c, --class", args.classes, "Classes implemented by the user");
+ }
+ 
+ void setupJsonComponentArgs(CLI::App& app, JsonComponentArgs& args)
+ {
+-  app.add_option("-o, --output", args.outFile, "output file");
+-  app.add_option("-n, --name", args.componentName, "name of the component");
++  app.add_option("-o, --output", args.outFile, "Output file");
++  app.add_option("-n, --name", args.componentName, "Name of the component");
+ }
+ 
+ }  // namespace
+@@ -507,7 +507,7 @@ void JsonGenerator::writeCombination(const std::string& outFile, const std::vect
+ void JsonGenerator::setupGenJsonPackage(CLI::App& app)
+ {
+   auto jsonPackageArgs = std::make_shared<JsonPackageArgs>();
+-  auto jsonPackage = app.add_subcommand("package", "generates JSON schemas for packages");
++  auto jsonPackage = app.add_subcommand("package", "Generate JSON schemas for packages");
+   jsonPackage->allow_extras();
+   jsonPackage->require_subcommand();
+ 
+@@ -544,7 +544,7 @@ void JsonGenerator::setupGenJsonPackage(CLI::App& app)
+ void JsonGenerator::setupGenJsonComponent(CLI::App& app)
+ {
+   auto jsonComponentArgs = std::make_shared<JsonComponentArgs>();
+-  auto jsonComponent = app.add_subcommand("component", "generates JSON schemas for components");
++  auto jsonComponent = app.add_subcommand("component", "Generate JSON schemas for components");
+   jsonComponent->allow_extras();
+   jsonComponent->require_subcommand();
+ 
+@@ -582,14 +582,14 @@ void JsonGenerator::setupGenJsonComponent(CLI::App& app)
+ void JsonGenerator::setupGenJsonSchemaArgs(CLI::App& app)
+ {
+   auto jsonSchemaArgs = std::make_shared<JsonSchemaArgs>();
+-  auto jsonSchema = app.add_subcommand("schema", "generates JSON schemas for sen configurations");
++  auto jsonSchema = app.add_subcommand("schema", "Generate JSON schemas for sen configurations");
+   jsonSchema->allow_extras();
+ 
+   jsonSchema->add_option("schema_files", jsonSchemaArgs->schemas, "JSON schema files")
+     ->required()
+     ->check(CLI::ExistingFile);
+ 
+-  jsonSchema->add_option("-o, --output", jsonSchemaArgs->outFile, "output file");
++  jsonSchema->add_option("-o, --output", jsonSchemaArgs->outFile, "Output file");
+ 
+   jsonSchema->callback(
+     [jsonSchemaArgs]()
+@@ -601,7 +601,7 @@ void JsonGenerator::setupGenJsonSchemaArgs(CLI::App& app)
+ 
+ void JsonGenerator::setup(CLI::App& app)
+ {
+-  auto json = app.add_subcommand("json", "generates JSON schemas");
++  auto json = app.add_subcommand("json", "Generate JSON schemas");
+   json->allow_extras();
+   json->require_subcommand();
+ 
+diff --git a/apps/cli_gen/src/main.cpp b/apps/cli_gen/src/main.cpp
+index 036127e..d507ac8 100644
+--- a/apps/cli_gen/src/main.cpp
++++ b/apps/cli_gen/src/main.cpp
+@@ -6,6 +6,7 @@
+ // =====================================================================================================================
+ 
+ // app
++#include "completions/completions_generator.h"
+ #include "cpp/cpp_generator.h"
+ #include "json/json_generator.h"
+ #include "mkdocs/mkdocs_generator.h"
+@@ -13,6 +14,7 @@
+ #include "python/python_generator.h"
+ 
+ // sen
++#include "sen/cli/spec.h"
+ #include "sen/core/base/assert.h"
+ 
+ // cli11
+@@ -32,12 +34,12 @@
+ int runApp(int argc, char* argv[])
+ {
+   CLI::App app {"sen code generator\n"};
+-  app.name("sen gen");
++  app.name("sen generate");
+   app.get_formatter()->column_width(35);  // NOLINT
+   app.require_subcommand();
+ 
+   bool expectFailure = false;
+-  app.add_flag("--expect-failure", expectFailure, "expects a failure in the generation process (for testing purposes)");
++  app.add_flag("--expect-failure", expectFailure, "Expect a failure in the generation process (for testing purposes)");
+ 
+   try
+   {
+@@ -47,8 +49,11 @@ int runApp(int argc, char* argv[])
+     PythonGenerator::setup(app);
+     MkDocsGenerator::setup(app);
+     JsonGenerator::setup(app);
++    CompletionsGenerator::setup(app);
+ 
+-    app.footer("For help on specific commands run 'sen gen <command> --help'");
++    app.footer("For help on specific commands run 'sen generate <command> --help'");
++
++    sen::cli::dumpSpecIfRequested(argc, argv, app);
+ 
+     CLI11_PARSE(app, argc, argv)
+ 
+diff --git a/apps/cli_gen/src/mkdocs/mkdocs_generator.cpp b/apps/cli_gen/src/mkdocs/mkdocs_generator.cpp
+index f373499..553029b 100644
+--- a/apps/cli_gen/src/mkdocs/mkdocs_generator.cpp
++++ b/apps/cli_gen/src/mkdocs/mkdocs_generator.cpp
+@@ -570,8 +570,8 @@ void append(const std::vector<T>& src, std::vector<T>& target)
+ 
+ void setupMKDocsArgs(CLI::App& app, MKDocsArgs& args)
+ {
+-  app.add_option("-o, --output", args.outputFile, "output file");
+-  app.add_option("-t, --title", args.title, "document title");
++  app.add_option("-o, --output", args.outputFile, "Output file");
++  app.add_option("-t, --title", args.title, "Document title");
+ }
+ 
+ }  // namespace
+@@ -611,7 +611,7 @@ void MkDocsGenerator::write(const std::filesystem::path& outputFile, const std::
+ void MkDocsGenerator::setup(CLI::App& app)
+ {
+   auto mkdocsArgs = std::make_shared<MKDocsArgs>();
+-  auto mkdocs = app.add_subcommand("mkdocs", "generates MKDocs documentation");
++  auto mkdocs = app.add_subcommand("mkdocs", "Generate MkDocs documentation");
+   mkdocs->allow_extras();
+   mkdocs->require_subcommand();
+ 
+diff --git a/apps/cli_gen/src/plantuml/plantuml_generator.cpp b/apps/cli_gen/src/plantuml/plantuml_generator.cpp
+index 4c8c3a3..c378af2 100644
+--- a/apps/cli_gen/src/plantuml/plantuml_generator.cpp
++++ b/apps/cli_gen/src/plantuml/plantuml_generator.cpp
+@@ -204,10 +204,10 @@ std::string generateFile(inja::Environment& env,
+ 
+ void setupUmlArgs(CLI::App& app, UmlArgs& args)
+ {
+-  app.add_option("-o, --output", args.outputFile, "output plantuml file");
+-  auto onlyClasses = app.add_flag("--only-classes", args.onlyClasses, "only generate class diagrams");
+-  auto onlyTypes = app.add_flag("--only-types", args.onlyTypes, "only generate diagrams for basic types");
+-  auto noEnumerators = app.add_flag("--no-enumerators", args.noEnumerators, "do not generate enumerations");
++  app.add_option("-o, --output", args.outputFile, "Output PlantUML file");
++  auto onlyClasses = app.add_flag("--only-classes", args.onlyClasses, "Only generate class diagrams");
++  auto onlyTypes = app.add_flag("--only-types", args.onlyTypes, "Only generate diagrams for basic types");
++  auto noEnumerators = app.add_flag("--no-enumerators", args.noEnumerators, "Do not generate enumerations");
+ 
+   onlyClasses->excludes(onlyTypes);
+   onlyClasses->excludes(noEnumerators);
+@@ -266,7 +266,7 @@ void PlantUMLGenerator::write(const std::filesystem::path& outputFile,
+ void PlantUMLGenerator::setup(CLI::App& app)
+ {
+   auto umlArgs = std::make_shared<UmlArgs>();
+-  auto uml = app.add_subcommand("uml", "generates UML diagrams");
++  auto uml = app.add_subcommand("uml", "Generate UML diagrams");
+   uml->allow_extras();
+   uml->require_subcommand();
+ 
+diff --git a/apps/cli_gen/src/python/python_generator.cpp b/apps/cli_gen/src/python/python_generator.cpp
+index acd610b..0a4b4c9 100644
+--- a/apps/cli_gen/src/python/python_generator.cpp
++++ b/apps/cli_gen/src/python/python_generator.cpp
+@@ -239,7 +239,7 @@ void PythonGenerator::write(const std::filesystem::path& inputFile)
+ 
+ void PythonGenerator::setup(CLI::App& app)
+ {
+-  auto py = app.add_subcommand("py", "generates Python dataclasses");
++  auto py = app.add_subcommand("py", "Generate Python dataclasses");
+   py->allow_extras();
+   py->require_subcommand();
+ 
+diff --git a/apps/cli_gen/test/CMakeLists.txt b/apps/cli_gen/test/CMakeLists.txt
+index 1e10a19..5350edb 100644
+--- a/apps/cli_gen/test/CMakeLists.txt
++++ b/apps/cli_gen/test/CMakeLists.txt
+@@ -272,3 +272,5 @@ add_sen_integration_test(
+ 
+ # link them so the checker only runs if the generator succeeds
+ set_tests_properties(hla_fom_gen_integration_test_19 PROPERTIES ENVIRONMENT "PYTHONUNBUFFERED=1")
++
++add_subdirectory(completions)
+diff --git a/apps/cli_gen/test/completions/CMakeLists.txt b/apps/cli_gen/test/completions/CMakeLists.txt
+new file mode 100644
+index 0000000..cd0e9ee
+--- /dev/null
++++ b/apps/cli_gen/test/completions/CMakeLists.txt
+@@ -0,0 +1,64 @@
++# === CMakeLists.txt ===================================================================================================
++#                                               Sen Infrastructure
++#                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++#                                    See the LICENSE.txt file for more information.
++#                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++# ======================================================================================================================
++
++include(tps/json)
++include(tps/inja)
++
++# Unit tests for the completions generator. The production source files live in
++# ../src/completions/; we compile them directly into the test binary so each TEST_F can exercise
++# them without needing a separate shared library. The shell templates get their own header
++# dumps in a test-local output dir to keep this target self-contained.
++set(completions_src_dir ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
++
++set(completions_templates
++    ${completions_src_dir}/completions/templates/bash.j2
++    ${completions_src_dir}/completions/templates/fish.j2
++    ${completions_src_dir}/completions/templates/powershell.j2
++    ${completions_src_dir}/completions/templates/zsh.j2
++)
++
++sen_internal_generate_template_headers(
++  OUTDIR
++  ${CMAKE_CURRENT_BINARY_DIR}/completions_templates
++  GEN_FILE_LIST
++  completions_template_dumps
++  TEMPLATE_FILES
++  ${completions_templates}
++)
++
++set(completions_src
++    ${completions_src_dir}/completions/completion_tree.cpp
++    ${completions_src_dir}/completions/emitters.cpp
++    ${completions_src_dir}/completions/spec_merge.cpp
++)
++
++set(completions_tests
++    completion_tree_test.cpp
++    emitters_test.cpp
++    spec_merge_test.cpp
++)
++
++add_sen_unit_test_suite(
++  completions_test
++  ${completions_src}
++  ${completions_tests}
++  ${completions_template_dumps}
++  LINK_DEPS
++  sen::core
++  $<BUILD_INTERFACE:nlohmann_json::nlohmann_json>
++  $<BUILD_INTERFACE:pantor::inja>
++)
++
++target_include_directories(
++  completions_test
++  PRIVATE ${completions_src_dir}
++  PRIVATE ${CMAKE_CURRENT_BINARY_DIR}
++)
++
++set_target_properties(
++  completions_test PROPERTIES FOLDER "test" RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin"
++)
+diff --git a/apps/cli_gen/test/completions/completion_tree_test.cpp b/apps/cli_gen/test/completions/completion_tree_test.cpp
+new file mode 100644
+index 0000000..23e3cb9
+--- /dev/null
++++ b/apps/cli_gen/test/completions/completion_tree_test.cpp
+@@ -0,0 +1,186 @@
++// === completion_tree_test.cpp =======================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#include "completions/completion_tree.h"
++
++// nlohmann
++#include <nlohmann/json.hpp>
++
++// google test
++#include <gtest/gtest.h>
++
++namespace completions
++{
++
++namespace
++{
++
++/// Helper that returns a minimal spec mirroring what build_spec emits for a small CLI.
++nlohmann::json makeSampleSpec()
++{
++  return nlohmann::json::parse(R"JSON({
++    "name": "sen",
++    "path": ["sen"],
++    "description": "Welcome to sen",
++    "allow_extras": false,
++    "require_subcommand": false,
++    "options": [],
++    "subcommands": [
++      {
++        "name": "run",
++        "path": ["sen", "run"],
++        "description": "Run a sen kernel",
++        "allow_extras": true,
++        "require_subcommand": false,
++        "options": [
++          { "kind": "positional", "name": "config", "long": [], "short": [],
++            "type_name": "TEXT:PATH(existing)", "choices": [], "required": false,
++            "description": "Configuration file", "deprecated": false },
++          { "kind": "option", "name": "--preset", "long": ["--preset"], "short": [],
++            "type_name": "TEXT:{shell,explorer,replay}",
++            "choices": ["shell", "explorer", "replay"],
++            "required": false, "description": "Preset name", "deprecated": false },
++          { "kind": "flag", "name": "--start-stop", "long": ["--start-stop"], "short": [],
++            "type_name": "", "choices": [], "required": false,
++            "description": "Stop after start", "deprecated": false }
++        ],
++        "subcommands": []
++      },
++      {
++        "name": "legacy",
++        "path": ["sen", "legacy"],
++        "description": "deprecated alias",
++        "allow_extras": false,
++        "require_subcommand": false,
++        "options": [],
++        "subcommands": [],
++        "deprecated": true
++      }
++    ]
++  })JSON");
++}
++
++const NodeFacts* findNode(const CompletionTree& tree, const std::string& path)
++{
++  for (const auto& node: tree.nodes)
++  {
++    if (node.path == path)
++    {
++      return &node;
++    }
++  }
++  return nullptr;
++}
++
++}  // namespace
++
++/// @test
++/// Walker produces one NodeFacts per non-deprecated node, with path built from spec's path array.
++TEST(CompletionTreeTest, nodePathsAndSubcommands)
++{
++  const auto tree = buildCompletionTree(makeSampleSpec());
++
++  // Two non-deprecated nodes: "sen" and "sen run". Deprecated "sen legacy" is skipped.
++  ASSERT_EQ(tree.nodes.size(), 2U);
++
++  const auto* root = findNode(tree, "sen");
++  ASSERT_NE(root, nullptr);
++  // Deprecated "legacy" subcommand is filtered from root's subcommand list too.
++  ASSERT_EQ(root->subcommands.size(), 1U);
++  EXPECT_EQ(root->subcommands[0].name, "run");
++  EXPECT_EQ(root->subcommands[0].description, "Run a sen kernel");
++
++  const auto* run = findNode(tree, "sen run");
++  ASSERT_NE(run, nullptr);
++  EXPECT_TRUE(run->subcommands.empty());
++}
++
++/// @test
++/// Flags and value-taking options are distinguished; both appear in allOptionTokens but only
++/// value-taking options appear in optionsTakingValue.
++TEST(CompletionTreeTest, optionsTakingValueSeparation)
++{
++  const auto tree = buildCompletionTree(makeSampleSpec());
++  const auto* run = findNode(tree, "sen run");
++  ASSERT_NE(run, nullptr);
++
++  ASSERT_EQ(run->allOptionTokens.size(), 2U);
++  EXPECT_EQ(run->allOptionTokens[0].name, "--preset");
++  EXPECT_EQ(run->allOptionTokens[0].description, "Preset name");
++  EXPECT_EQ(run->allOptionTokens[1].name, "--start-stop");
++  EXPECT_EQ(run->allOptionTokens[1].description, "Stop after start");
++
++  ASSERT_EQ(run->optionsTakingValue.size(), 1U);
++  EXPECT_EQ(run->optionsTakingValue[0].name, "--preset");
++}
++
++/// @test
++/// Positional type and choice list are captured on the owner node.
++TEST(CompletionTreeTest, positionalInfo)
++{
++  const auto tree = buildCompletionTree(makeSampleSpec());
++  const auto* run = findNode(tree, "sen run");
++  ASSERT_NE(run, nullptr);
++
++  EXPECT_EQ(run->positionalType, "TEXT:PATH(existing)");
++  EXPECT_TRUE(run->positionalChoices.empty());
++}
++
++/// @test
++/// Value-taking options produce one OptionFacts entry per token with choices attached.
++TEST(CompletionTreeTest, optionFactsRecordsChoices)
++{
++  const auto tree = buildCompletionTree(makeSampleSpec());
++  ASSERT_EQ(tree.options.size(), 1U);
++
++  const auto& opt = tree.options.front();
++  EXPECT_EQ(opt.path, "sen run");
++  EXPECT_EQ(opt.token, "--preset");
++  EXPECT_EQ(opt.typeName, "TEXT:{shell,explorer,replay}");
++  ASSERT_EQ(opt.choices.size(), 3U);
++  EXPECT_EQ(opt.choices[0].name, "shell");
++  EXPECT_EQ(opt.choices[1].name, "explorer");
++  EXPECT_EQ(opt.choices[2].name, "replay");
++}
++
++/// @test
++/// KVList helpers convert tree contents to the (key, space-joined-value) representation that
++/// shell emitters consume.
++TEST(CompletionTreeTest, subcommandsByPathProjection)
++{
++  const auto tree = buildCompletionTree(makeSampleSpec());
++  const auto kv = subcommandsByPath(tree);
++
++  ASSERT_EQ(kv.size(), 2U);
++  EXPECT_EQ(kv[0].first, "sen");
++  EXPECT_EQ(kv[0].second, "run");
++  EXPECT_EQ(kv[1].first, "sen run");
++  EXPECT_EQ(kv[1].second, "");
++}
++
++/// @test
++/// Per-option KVLists use "path|token" as the key.
++TEST(CompletionTreeTest, optionChoicesByKeyFormat)
++{
++  const auto tree = buildCompletionTree(makeSampleSpec());
++  const auto kv = optionChoicesByKey(tree);
++
++  ASSERT_EQ(kv.size(), 1U);
++  EXPECT_EQ(kv[0].first, "sen run|--preset");
++  EXPECT_EQ(kv[0].second, "shell explorer replay");
++}
++
++/// @test
++/// joinSpace produces the canonical space-joined form and copes with empty input.
++TEST(CompletionTreeTest, joinSpaceFormats)
++{
++  EXPECT_EQ(joinSpace({}), "");
++  EXPECT_EQ(joinSpace({"a"}), "a");
++  EXPECT_EQ(joinSpace({"a", "b", "c"}), "a b c");
++}
++
++}  // namespace completions
+diff --git a/apps/cli_gen/test/completions/emitters_test.cpp b/apps/cli_gen/test/completions/emitters_test.cpp
+new file mode 100644
+index 0000000..46edc90
+--- /dev/null
++++ b/apps/cli_gen/test/completions/emitters_test.cpp
+@@ -0,0 +1,131 @@
++// === emitters_test.cpp ==============================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#include "completions/completion_tree.h"
++
++// nlohmann
++#include <nlohmann/json.hpp>
++
++// google test
++#include <gtest/gtest.h>
++
++// std
++#include <sstream>
++#include <string>
++
++namespace completions
++{
++
++namespace
++{
++
++nlohmann::json trivialSpec()
++{
++  return nlohmann::json::parse(R"JSON({
++    "name": "sen",
++    "path": ["sen"],
++    "allow_extras": false,
++    "require_subcommand": false,
++    "options": [],
++    "subcommands": [
++      {
++        "name": "run",
++        "path": ["sen","run"],
++        "allow_extras": true,
++        "require_subcommand": false,
++        "options": [
++          { "kind": "option", "name": "--preset", "long": ["--preset"], "short": [],
++            "type_name": "TEXT", "choices": ["shell","explorer"], "required": false,
++            "description": "", "deprecated": false }
++        ],
++        "subcommands": []
++      }
++    ]
++  })JSON");
++}
++
++std::string renderFor(Shell shell)
++{
++  std::ostringstream oss;
++  emit(shell, trivialSpec(), oss);
++  return oss.str();
++}
++
++bool containsSubstring(const std::string& haystack, const std::string& needle)
++{
++  return haystack.find(needle) != std::string::npos;
++}
++
++}  // namespace
++
++/// @test
++/// The bash emitter declares every data section as an associative array. Spot-checking two
++/// (the first and one that exercises the registry iteration) is enough; the rest follow the
++/// same template expansion.
++TEST(EmittersTest, bashDeclaresDataSections)
++{
++  const auto script = renderFor(Shell::bash);
++  EXPECT_TRUE(containsSubstring(script, "declare -A _sen_subs=("));
++  EXPECT_TRUE(containsSubstring(script, "declare -A _sen_option_choices=("));
++}
++
++/// @test
++/// Subcommand names are emitted under the owning path.
++TEST(EmittersTest, bashSubcommandsMappedToParentPath)
++{
++  const auto script = renderFor(Shell::bash);
++  EXPECT_TRUE(containsSubstring(script, "[\"sen\"]=\"run\""));
++}
++
++/// @test
++/// A value-taking option with choices produces entries in both the option-type and
++/// option-choice tables, keyed by "path|token".
++TEST(EmittersTest, bashOptionChoicesKeyedByPathAndToken)
++{
++  const auto script = renderFor(Shell::bash);
++  EXPECT_TRUE(containsSubstring(script, "[\"sen run|--preset\"]=\"TEXT\""));
++  EXPECT_TRUE(containsSubstring(script, "[\"sen run|--preset\"]=\"shell explorer\""));
++}
++
++/// @test
++/// The walker + dispatch logic are emitted verbatim at the end.
++TEST(EmittersTest, bashEmitsCompletionRegistration)
++{
++  const auto script = renderFor(Shell::bash);
++  EXPECT_TRUE(containsSubstring(script, "complete -F _sen_complete sen"));
++}
++
++/// @test
++/// Every shell produces output that includes the subcommand name from the spec. This is a
++/// sanity check that the template-plus-context wiring is alive for all four shells, without
++/// coupling the test to each shell's syntax.
++TEST(EmittersTest, everyShellMentionsRegisteredSubcommand)
++{
++  for (auto shell: {Shell::bash, Shell::zsh, Shell::fish, Shell::powershell})
++  {
++    std::ostringstream oss;
++    emit(shell, trivialSpec(), oss);
++    EXPECT_TRUE(containsSubstring(oss.str(), "run")) << "shell enum value: " << static_cast<int>(shell);
++  }
++}
++
++/// @test
++/// The PowerShell emitter escapes single quotes in data values (since the generated syntax
++/// wraps keys/values in single quotes).
++TEST(EmittersTest, powerShellEscapesSingleQuotes)
++{
++  // Craft a spec with a single quote in a choice value; verify the emitted script doubles it.
++  auto spec = trivialSpec();
++  auto& opt = spec["subcommands"][0]["options"][0];
++  opt["choices"] = nlohmann::json::array({"it's"});
++
++  std::ostringstream oss;
++  emit(Shell::powershell, spec, oss);
++  EXPECT_TRUE(containsSubstring(oss.str(), "it''s"));
++}
++
++}  // namespace completions
+diff --git a/apps/cli_gen/test/completions/spec_merge_test.cpp b/apps/cli_gen/test/completions/spec_merge_test.cpp
+new file mode 100644
+index 0000000..3c585fd
+--- /dev/null
++++ b/apps/cli_gen/test/completions/spec_merge_test.cpp
+@@ -0,0 +1,106 @@
++// === spec_merge_test.cpp ============================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#include "completions/spec_merge.h"
++
++// nlohmann
++#include <nlohmann/json.hpp>
++
++// google test
++#include <gtest/gtest.h>
++
++// std
++#include <stdexcept>
++
++namespace completions
++{
++
++namespace
++{
++
++nlohmann::json rootSpec()
++{
++  return nlohmann::json::parse(R"JSON({
++    "name": "sen",
++    "path": ["sen"],
++    "subcommands": [
++      { "name": "run",  "path": ["sen","run"],  "options": [], "subcommands": [] },
++      { "name": "gen",  "path": ["sen","gen"],  "options": [], "subcommands": [] }
++    ]
++  })JSON");
++}
++
++nlohmann::json runSpec()
++{
++  return nlohmann::json::parse(R"JSON({
++    "name": "sen run",
++    "path": ["sen", "run"],
++    "allow_extras": true,
++    "require_subcommand": false,
++    "options": [
++      { "kind": "option", "name": "--preset", "long": ["--preset"], "short": [],
++        "type_name": "TEXT", "choices": ["shell","explorer"], "required": false,
++        "description": "", "deprecated": false }
++    ],
++    "subcommands": []
++  })JSON");
++}
++
++}  // namespace
++
++/// @test
++/// A child spec's options and subcommands replace the matching placeholder under the root.
++TEST(SpecMergeTest, graftsChildUnderMatchingSubcommand)
++{
++  const auto merged = mergeSpecs({rootSpec(), runSpec()});
++
++  ASSERT_TRUE(merged.contains("subcommands"));
++  const auto& subs = merged["subcommands"];
++  ASSERT_EQ(subs.size(), 2U);
++
++  const auto& run = subs[0];
++  EXPECT_EQ(run["name"], "run");
++  ASSERT_EQ(run["options"].size(), 1U);
++  EXPECT_EQ(run["options"][0]["name"], "--preset");
++  EXPECT_EQ(run["allow_extras"], true);
++}
++
++/// @test
++/// A child spec whose path does not match any slot in the root is silently ignored, not applied
++/// somewhere else. (Protects against a renamed binary corrupting the tree.)
++TEST(SpecMergeTest, childWithUnknownPathIsIgnored)
++{
++  auto stray = runSpec();
++  stray["name"] = "sen unknown";
++  stray["path"] = nlohmann::json::array({"sen", "unknown"});
++
++  const auto merged = mergeSpecs({rootSpec(), stray});
++
++  // Root children untouched; "run" has its original (empty) options, not stray's.
++  const auto& subs = merged["subcommands"];
++  ASSERT_EQ(subs.size(), 2U);
++  EXPECT_EQ(subs[0]["name"], "run");
++  EXPECT_TRUE(subs[0]["options"].empty());
++}
++
++/// @test
++/// Order of specs in the input vector does not matter; the root can appear anywhere.
++TEST(SpecMergeTest, rootCanAppearAnywhereInInput)
++{
++  const auto merged = mergeSpecs({runSpec(), rootSpec()});
++  ASSERT_EQ(merged.value("name", ""), "sen");
++  EXPECT_EQ(merged["subcommands"][0]["options"][0]["name"], "--preset");
++}
++
++/// @test
++/// Missing root spec is a hard error.
++TEST(SpecMergeTest, throwsWhenRootMissing)
++{
++  EXPECT_THROW(mergeSpecs({runSpec()}), std::runtime_error);
++}
++
++}  // namespace completions
+diff --git a/apps/cli_package/CMakeLists.txt b/apps/cli_package/CMakeLists.txt
+index bfed13a..3e108c5 100644
+--- a/apps/cli_package/CMakeLists.txt
++++ b/apps/cli_package/CMakeLists.txt
+@@ -60,6 +60,7 @@ add_executable(
+ target_link_libraries(
+   cli_package
+   PRIVATE sen::core
++  PRIVATE sen::cli_common
+   PRIVATE $<BUILD_INTERFACE:CLI11::CLI11>
+   PRIVATE $<BUILD_INTERFACE:nlohmann_json::nlohmann_json>
+   PRIVATE $<BUILD_INTERFACE:pantor::inja>
+diff --git a/apps/cli_package/init_component.cpp b/apps/cli_package/init_component.cpp
+index cb2e2f9..60dd0f0 100644
+--- a/apps/cli_package/init_component.cpp
++++ b/apps/cli_package/init_component.cpp
+@@ -12,6 +12,9 @@
+ #include "templates/component/config_stl.h"
+ #include "util.h"
+ 
++// sen
++#include "sen/core/base/string_case.h"
++
+ // cli11
+ #include <CLI/App.hpp>
+ 
+@@ -70,13 +73,13 @@ void writeComponent(Args& args)
+   // use snake case for the target name names and the component folder
+   args.componentName = args.path.filename().generic_string();
+ 
+-  if (!isUpperCamelCase(args.componentName))
++  if (!sen::isUpperCamelCase(args.componentName))
+   {
+     std::cerr << "component names must be upper camel cased\n";
+     exit(1);
+   }
+ 
+-  args.targetName = toSnakeCase(args.componentName);
++  args.targetName = sen::toSnakeCase(args.componentName);
+   args.path.replace_filename(args.targetName);
+   args.stlFilesRelPath = std::filesystem::path("stl") / args.targetName;
+   args.srcFilesRelPath = "src";
+diff --git a/apps/cli_package/init_package.cpp b/apps/cli_package/init_package.cpp
+index 2df8410..582c9cd 100644
+--- a/apps/cli_package/init_package.cpp
++++ b/apps/cli_package/init_package.cpp
+@@ -13,6 +13,9 @@
+ #include "templates/package/config_yaml.h"
+ #include "util.h"
+ 
++// sen
++#include "sen/core/base/string_case.h"
++
+ // cli11
+ #include <CLI/App.hpp>
+ 
+@@ -43,15 +46,15 @@ struct Args
+ 
+ std::filesystem::path getClassSTLFileRelPath(const Args& args, const std::string& className)
+ {
+-  return (args.stlFilesRelPath / toSnakeCase(className)).replace_extension(".stl");
++  return (args.stlFilesRelPath / sen::toSnakeCase(className)).replace_extension(".stl");
+ }
+ 
+ std::filesystem::path getClassCppFileRelPath(const Args& args, const std::string& className)
+ {
+-  return (args.srcFilesRelPath / toSnakeCase(className)).replace_extension(".cpp");
++  return (args.srcFilesRelPath / sen::toSnakeCase(className)).replace_extension(".cpp");
+ }
+ 
+-std::filesystem::path getClassHFile(const std::string& className) { return toSnakeCase(className) + ".h"; }
++std::filesystem::path getClassHFile(const std::string& className) { return sen::toSnakeCase(className) + ".h"; }
+ 
+ std::filesystem::path getClassHFileRelPath(const Args& args, const std::string& className)
+ {
+@@ -85,7 +88,7 @@ inja::json getPackageData(const Args& args)
+ void writePackage(Args& args)
+ {
+   // use snake case for package names and folders
+-  args.packageName = toSnakeCase(args.path.filename().string());
++  args.packageName = sen::toSnakeCase(args.path.filename().string());
+   args.stlFilesRelPath = std::filesystem::path("stl") / args.packageName;
+   args.srcFilesRelPath = "src";
+ 
+@@ -121,18 +124,20 @@ void writePackage(Args& args)
+   writeFile(args.path / sourceFile, basic_class_source, basic_class_sourceSize, classData);
+   writeFile(args.path / "config.yaml", config_yaml, config_yamlSize, classData);
+ 
+-  printf("To compile:\n");                                         // NOLINT
+-  printf("        cd %s\n", args.path.string().c_str());           // NOLINT
+-  printf("        cmake -S . -B build && cmake --build build\n");  // NOLINT
+-  printf("\n");                                                    // NOLINT
+-  printf("To set-up (bash):\n");                                   // NOLINT
+-  printf("        export LD_LIBRARY_PATH+=$(pwd)/build/bin\n");    // NOLINT
+-  printf("\n");                                                    // NOLINT
+-  printf("To set-up (fish):\n");                                   // NOLINT
+-  printf("        set -xa LD_LIBRARY_PATH $(pwd)/build/bin\n");    // NOLINT
+-  printf("\n");                                                    // NOLINT
+-  printf("To run:\n");                                             // NOLINT
+-  printf("        sen run config.yaml\n");                         // NOLINT
++  printf("To compile:\n");                                                           // NOLINT(hicpp-vararg)
++  printf("        cd %s\n", args.path.string().c_str());                             // NOLINT(hicpp-vararg)
++  printf("        cmake -S . -B build && cmake --build build\n");                    // NOLINT(hicpp-vararg)
++  printf("\n");                                                                      // NOLINT(hicpp-vararg)
++  printf("To set up the library path:\n");                                           // NOLINT(hicpp-vararg)
++  printf("  bash / zsh:\n");                                                         // NOLINT(hicpp-vararg)
++  printf("        export LD_LIBRARY_PATH=\"$(pwd)/build/bin:$LD_LIBRARY_PATH\"\n");  // NOLINT(hicpp-vararg)
++  printf("  fish:\n");                                                               // NOLINT(hicpp-vararg)
++  printf("        set -xa LD_LIBRARY_PATH $(pwd)/build/bin\n");                      // NOLINT(hicpp-vararg)
++  printf("  PowerShell (Windows):\n");                                               // NOLINT(hicpp-vararg)
++  printf("        $env:PATH = \"$PWD\\build\\bin;$env:PATH\"\n");                    // NOLINT(hicpp-vararg)
++  printf("\n");                                                                      // NOLINT(hicpp-vararg)
++  printf("To run:\n");                                                               // NOLINT(hicpp-vararg)
++  printf("        sen run config.yaml\n");                                           // NOLINT(hicpp-vararg)
+ }
+ 
+ }  // namespace
+diff --git a/apps/cli_package/main.cpp b/apps/cli_package/main.cpp
+index 8a55139..1c44dcf 100644
+--- a/apps/cli_package/main.cpp
++++ b/apps/cli_package/main.cpp
+@@ -7,6 +7,9 @@
+ 
+ #include "util.h"
+ 
++// sen
++#include "sen/cli/spec.h"
++
+ // cli11
+ #include <CLI/App.hpp>
+ #include <CLI/CLI.hpp>  // NOLINT (misc-include-cleaner): to correctly link
+@@ -17,13 +20,15 @@
+ 
+ int runApp(int argc, char* argv[])
+ {
+-  CLI::App app {"This is the sen package helper\n"};
++  CLI::App app {"Create or manipulate sen packages\n"};
+   app.name("sen package");
+   app.get_formatter()->column_width(35);  // NOLINT
+ 
+   setupInitPackage(app);
+   setupInitComponent(app);
+ 
++  sen::cli::dumpSpecIfRequested(argc, argv, app);
++
+   CLI11_PARSE(app, argc, argv);
+   return 0;
+ }
+diff --git a/apps/cli_package/util.cpp b/apps/cli_package/util.cpp
+index cfa4656..167c3f6 100644
+--- a/apps/cli_package/util.cpp
++++ b/apps/cli_package/util.cpp
+@@ -15,11 +15,8 @@
+ #include <inja/json.hpp>
+ 
+ // std
+-#include <cctype>
+-#include <cstddef>
+ #include <filesystem>
+ #include <fstream>
+-#include <string>
+ 
+ void writeFile(std::filesystem::path path,
+                const unsigned* templateData,
+@@ -31,47 +28,3 @@ void writeFile(std::filesystem::path path,
+   std::ofstream file(path);
+   inja::render_to(file, templateStr, packageData);
+ }
+-
+-std::string toSnakeCase(const std::string& str)
+-{
+-  std::string result;
+-
+-  for (std::size_t i = 0; i < str.size(); ++i)
+-  {
+-    if (std::isupper(str[i]) != 0)
+-    {
+-      if (i != 0)
+-      {
+-        result.append(1U, '_');
+-      }
+-      result.append(1U, static_cast<char>(std::tolower(str[i])));
+-    }
+-    else
+-    {
+-      result.append(1U, str[i]);
+-    }
+-  }
+-  return result;
+-}
+-
+-bool isUpperCamelCase(const std::string& str)
+-{
+-  if (str.empty())
+-  {
+-    return true;
+-  }
+-
+-  if (std::islower(str.at(0U)) != 0)
+-  {
+-    return false;
+-  }
+-
+-  // no spaces
+-  if (str.find_first_of(' ') != std::string::npos)
+-  {
+-    return false;
+-  }
+-
+-  // no underscores
+-  return str.find_first_of('_') == std::string::npos;
+-}
+diff --git a/apps/cli_package/util.h b/apps/cli_package/util.h
+index aa7d1aa..1067e45 100644
+--- a/apps/cli_package/util.h
++++ b/apps/cli_package/util.h
+@@ -20,12 +20,6 @@
+ void setupInitPackage(CLI::App& app);
+ void setupInitComponent(CLI::App& app);
+ 
+-// TODO SEN-1032: Add to common cli_gen utils
+-std::string toSnakeCase(const std::string& str);
+-
+-// TODO SEN-1032: Add to common cli_gen utils
+-bool isUpperCamelCase(const std::string& str);
+-
+ void writeFile(std::filesystem::path path,
+                const unsigned* templateData,
+                unsigned templateDataSize,
+diff --git a/apps/cli_remote_shell/CMakeLists.txt b/apps/cli_remote_shell/CMakeLists.txt
+index 4196962..2dc7a1b 100644
+--- a/apps/cli_remote_shell/CMakeLists.txt
++++ b/apps/cli_remote_shell/CMakeLists.txt
+@@ -12,6 +12,7 @@ add_executable(cli_remote_shell main.cpp)
+ target_link_libraries(
+   cli_remote_shell
+   PUBLIC sen::core sen::kernel
++  PRIVATE sen::cli_common
+   PRIVATE $<BUILD_INTERFACE:CLI11::CLI11>
+   PRIVATE terminal_lib
+ )
+diff --git a/apps/cli_remote_shell/main.cpp b/apps/cli_remote_shell/main.cpp
+index debb710..0325701 100644
+--- a/apps/cli_remote_shell/main.cpp
++++ b/apps/cli_remote_shell/main.cpp
+@@ -9,6 +9,7 @@
+ #include "remote_terminal_server.h"
+ 
+ // sen
++#include "sen/cli/spec.h"
+ #include "sen/core/io/util.h"
+ 
+ // cli11
+@@ -30,10 +31,10 @@ int runApp(int argc, char* argv[])
+   };
+   auto args = std::make_shared<ProgramArgs>();
+ 
+-  CLI::App app {"Connects to a remote sen shell\n"};
++  CLI::App app {"Connect to a remote sen shell\n"};
+   app.name("sen rshell");
+   app.get_formatter()->column_width(35);  // NOLINT
+-  app.add_option("address", args->address, "Address of the sen process (format <host>[:<port>]")->required();
++  app.add_option("address", args->address, "Address of the sen process (format <host>[:<port>])")->required();
+ 
+   app.callback(
+     [args]()
+@@ -46,6 +47,8 @@ int runApp(int argc, char* argv[])
+       client.run(tokens.front(), port);
+     });
+ 
++  sen::cli::dumpSpecIfRequested(argc, argv, app);
++
+   CLI11_PARSE(app, argc, argv);
+   return 0;
+ }
+diff --git a/apps/cli_run/CMakeLists.txt b/apps/cli_run/CMakeLists.txt
+index d8bb544..c43e714 100644
+--- a/apps/cli_run/CMakeLists.txt
++++ b/apps/cli_run/CMakeLists.txt
+@@ -35,6 +35,7 @@ add_executable(cli_run ${builtin_configs_headers} main.cpp)
+ target_link_libraries(
+   cli_run
+   PUBLIC sen::core sen::kernel
++  PRIVATE sen::cli_common
+   PRIVATE $<BUILD_INTERFACE:CLI11::CLI11> $<BUILD_INTERFACE:spdlog::spdlog>
+ )
+ 
+diff --git a/apps/cli_run/main.cpp b/apps/cli_run/main.cpp
+index c43ed55..f3e1091 100644
+--- a/apps/cli_run/main.cpp
++++ b/apps/cli_run/main.cpp
+@@ -11,9 +11,9 @@
+ #include "builtin_configs/shell.h"
+ 
+ // sen
++#include "sen/cli/spec.h"
+ #include "sen/core/base/assert.h"
+ #include "sen/core/base/hash32.h"
+-#include "sen/core/meta/enum_type.h"
+ #include "sen/kernel/bootloader.h"
+ #include "sen/kernel/kernel.h"
+ 
+@@ -42,18 +42,6 @@
+ #include <tuple>
+ #include <vector>
+ 
+-std::vector<std::string> getEnumerators(const sen::EnumType& type)
+-{
+-  std::vector<std::string> result;
+-  result.reserve(type.getEnums().size());
+-  for (const auto& elem: type.getEnums())
+-  {
+-    result.push_back(elem.name);
+-  }
+-
+-  return result;
+-}
+-
+ [[nodiscard]] bool replace(std::string& str, const std::string& from, const std::string& to)
+ {
+   size_t startPos = str.find(from);
+@@ -215,16 +203,27 @@ int runApp(int argc, char* argv[])
+ {
+   auto args = std::make_shared<RunArgs>();
+ 
+-  CLI::App app {"This is the sen kernel runner\n"};
++  CLI::App app {"Run a sen kernel\n"};
+   app.name("sen run");
+   app.allow_extras();
+   app.get_formatter()->column_width(35);
+ 
+   app.add_option("config", args->configFile, "Configuration file")->check(CLI::ExistingPath);
+-  app.add_option("--preset", args->preset, "Preset name")->check(CLI::IsMember({"shell", "explorer", "replay"}));
+-  app.add_flag("--start-stop", args->startStop, "Stops execution after all components are running");
++  sen::cli::addChoice(
++    app,
++    "--preset",
++    args->preset,
++    std::vector<sen::cli::Choice> {
++      {"shell", "Interactive REPL attached to a running kernel"},
++      {"explorer", "Visual object and property explorer"},
++      {"replay", "Playback of a recorded archive"},
++    },
++    "Preset name");
++  app.add_flag("--start-stop", args->startStop, "Stop execution after all components are running");
+   app.add_flag("--print-config", args->printConfig, "Print the configuration that will be used");
+ 
++  sen::cli::dumpSpecIfRequested(argc, argv, app);
++
+   CLI11_PARSE(app, argc, argv)
+ 
+   return runKernel(args, app);
+diff --git a/apps/cli_sen/CMakeLists.txt b/apps/cli_sen/CMakeLists.txt
+index 080df0c..82d76c9 100644
+--- a/apps/cli_sen/CMakeLists.txt
++++ b/apps/cli_sen/CMakeLists.txt
+@@ -13,6 +13,7 @@ target_link_libraries(
+   cli_sen
+   PRIVATE $<BUILD_INTERFACE:CLI11::CLI11>
+   PRIVATE core
++  PRIVATE sen::cli_common
+ )
+ 
+ add_executable(sen::sen ALIAS cli_sen)
+diff --git a/apps/cli_sen/main.cpp b/apps/cli_sen/main.cpp
+index 27f8a4e..0921583 100644
+--- a/apps/cli_sen/main.cpp
++++ b/apps/cli_sen/main.cpp
+@@ -5,6 +5,9 @@
+ //                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
+ // =====================================================================================================================
+ 
++// sen
++#include "sen/cli/spec.h"
++#include "sen/core/base/assert.h"
+ #include "sen/core/base/hash32.h"
+ #include "sen/core/base/version.h"
+ 
+@@ -22,13 +25,17 @@
+ #endif
+ 
+ // std
++#include <array>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <exception>
+ #include <filesystem>
++#include <fstream>
+ #include <iostream>
+ #include <memory>
+ #include <string>
++#include <string_view>
++#include <utility>
+ #include <vector>
+ 
+ #ifdef WIN32
+@@ -78,12 +85,12 @@ std::filesystem::path getExePath()
+ #endif
+ }
+ 
+-void configureSubcommand(CLI::App& app,
+-                         const char* name,
+-                         const char* description,
+-                         const char* binPath,
+-                         int argc,
+-                         char* argv[])
++CLI::App* configureSubcommand(CLI::App& app,
++                              const char* name,
++                              const char* description,
++                              const char* binPath,
++                              int argc,
++                              char* argv[])
+ {
+   auto cmd = app.add_subcommand(name, description);
+   cmd->allow_extras();
+@@ -95,6 +102,7 @@ void configureSubcommand(CLI::App& app,
+       auto bin = getExePath().parent_path() / binPath;
+       runChildProcess(bin.generic_string().c_str(), argc, argv);
+     });
++  return cmd;
+ }
+ 
+ void configureFileToArray(CLI::App& app)
+@@ -107,26 +115,94 @@ void configureFileToArray(CLI::App& app)
+   };
+   std::shared_ptr<Args> args = std::make_shared<Args>();
+ 
+-  auto cmd = app.add_subcommand("fileToArray", "simple utility to convert a file to a C++ array");
++  auto configure = [args](CLI::App* cmd)
++  {
++    cmd->add_option("-i", args->inputFile, "File to read")->required()->check(CLI::ExistingFile);
++    cmd->add_option("-o", args->outputFile, "File to write")->required();
++    cmd->add_option("-v", args->varName, "Name of the variable that will hold the data")->required();
++    cmd->callback(
++      [args]()
++      {
++        if (!sen::fileToCompressedArrayFile(args->inputFile, args->varName, args->outputFile))
++        {
++          std::cerr << "error compressing data\n";
++          exit(1);
++        }
++      });
++  };
++
++  configure(app.add_subcommand("file-to-array", "Simple utility to convert a file to a C++ array"));
++  // Hidden alias; kept for backward compatibility with existing CMake scripts.
++  configure(app.add_subcommand("fileToArray", "Alias for 'file-to-array'")->group(""));
++}
++
++void configureCompletion(CLI::App& app)
++{
++  struct Args
++  {
++    std::string shell;
++  };
++  auto args = std::make_shared<Args>();
++
++  // Users run this once during setup (following the installation doc) and never again, so it
++  // adds no value to shell-completion lists. Hidden from --help and from generated completion
++  // scripts via ->group("").
++  auto cmd = app.add_subcommand("completion", "Print the shell completion script for the sen CLI");
++  cmd->group("");
++  sen::cli::addChoice(*cmd, "shell", args->shell, {"bash", "zsh", "fish", "powershell"}, "Target shell")
++    ->required();
+ 
+-  cmd->add_option("-i", args->inputFile, "File to read")->required()->check(CLI::ExistingFile);
+-  cmd->add_option("-o", args->outputFile, "File to write")->required();
+-  cmd->add_option("-v", args->varName, "Name of the variable that will hold the data")->required();
+   cmd->callback(
+     [args]()
+     {
+-      if (!sen::fileToCompressedArrayFile(args->inputFile, args->varName, args->outputFile))
++      static constexpr std::array<std::pair<std::string_view, std::string_view>, 4> fileByShell = {{
++        {"bash", "sen.bash"},
++        {"zsh", "_sen"},
++        {"fish", "sen.fish"},
++        {"powershell", "sen.ps1"},
++      }};
++
++      std::string_view fileName;
++      for (const auto& [shell, file]: fileByShell)
++      {
++        if (shell == args->shell)
++        {
++          fileName = file;
++          break;
++        }
++      }
++      SEN_ASSERT(!fileName.empty() && "choice validation should reject unknown shells");
++
++      const auto binDir = getExePath().parent_path();
++      const std::array<std::filesystem::path, 2> candidates = {
++        binDir / ".." / "share" / "sen" / "completions" / fileName,
++        binDir / "completions" / fileName,
++      };
++
++      for (const auto& path: candidates)
+       {
+-        std::cerr << "error compressing data\n";
+-        exit(1);
++        std::ifstream in(path);
++        if (in.is_open())
++        {
++          std::cout << in.rdbuf();
++          return;
++        }
+       }
++
++      std::cerr << "sen: completion script not found for shell '" << args->shell
++                << "'; expected at one of:\n";
++      for (const auto& path: candidates)
++      {
++        std::cerr << "  " << path << '\n';
++      }
++      exit(1);
+     });
+ }
+ 
+ void configureShortcut(CLI::App& app, const char* preset, int argc, char* argv[])
+ {
+   std::string description;
+-  description.append("shortcut to run the sen ");
++  description.append("Shortcut to run the sen ");
+   description.append(preset);
+   description.append(" stand-alone");
+ 
+@@ -165,7 +241,7 @@ void configureShortcuts(CLI::App& app, int argc, char* argv[])
+ 
+   // remote shell
+   {
+-    std::string description = "shortcut to connect to a remote sen shell";
++    std::string description = "Shortcut to connect to a remote sen shell";
+ 
+     auto cmd = app.add_subcommand("rshell", description);
+     cmd->allow_extras();
+@@ -201,15 +277,23 @@ int runApp(int argc, char* argv[])
+     app.set_version_flag("--version", SEN_VERSION_STRING);
+     app.get_formatter()->column_width(15);  // NOLINT
+ 
+-    configureSubcommand(app, "run", "runs a sen kernel", "cli_run", argc, argv);
+-    configureSubcommand(app, "gen", "generates code (mainly used by build systems)", "cli_gen", argc, argv);
+-    configureSubcommand(app, "archive", "allows inspecting archives", "cli_archive", argc, argv);
+-    configureSubcommand(app, "package", "creates or manipulates sen packages", "cli_package", argc, argv);
++    configureSubcommand(app, "run", "Run a sen kernel", "cli_run", argc, argv);
++    configureSubcommand(app, "generate", "Generate code (mainly used by build systems)", "cli_gen", argc, argv);
++    configureSubcommand(app, "archive", "Inspect archives", "cli_archive", argc, argv);
++    configureSubcommand(app, "package", "Create or manipulate sen packages", "cli_package", argc, argv);
+     configureFileToArray(app);
++    configureCompletion(app);
+     configureShortcuts(app, argc, argv);
+ 
++    // Hidden aliases for renamed subcommands. Still functional for backward compatibility;
++    // ->group("") hides them from --help and marks them deprecated in the generated spec so
++    // completion scripts do not suggest them.
++    configureSubcommand(app, "gen", "Alias for 'generate'", "cli_gen", argc, argv)->group("");
++
+     app.footer("For help on specific commands run 'sen <command> --help'");
+ 
++    sen::cli::dumpSpecIfRequested(argc, argv, app);
++
+     app.parse(argc, argv);
+   }
+   catch (const CLI::ParseError& e)
+diff --git a/cmake/util/sen_misc_utils.cmake b/cmake/util/sen_misc_utils.cmake
+index 7217197..f55c120 100644
+--- a/cmake/util/sen_misc_utils.cmake
++++ b/cmake/util/sen_misc_utils.cmake
+@@ -260,7 +260,7 @@ function(sen_file_to_cpp)
+   add_custom_command(
+     OUTPUT ${sen_file_to_cpp_OUT}
+     COMMAND_EXPAND_LISTS VERBATIM
+-    COMMAND sen::cli_sen fileToArray -i ${_abs_in_file} -o ${_abs_out_file} -v ${sen_file_to_cpp_VARNAME}
++    COMMAND sen::cli_sen file-to-array -i ${_abs_in_file} -o ${_abs_out_file} -v ${sen_file_to_cpp_VARNAME}
+     DEPENDS ${_abs_in_file} sen::cli_sen
+     COMMENT "generating ${_abs_in_file} into ${_abs_out_file}"
+   )
+diff --git a/cmake/util/sen_package_utils.cmake b/cmake/util/sen_package_utils.cmake
+index beb6498..741d120 100644
+--- a/cmake/util/sen_package_utils.cmake
++++ b/cmake/util/sen_package_utils.cmake
+@@ -232,7 +232,7 @@ function(add_sen_package)
+     add_custom_command(
+       OUTPUT ${_exports_file}
+       COMMAND_EXPAND_LISTS VERBATIM
+-      COMMAND sen::cli_gen exp_package ${_export_args}
++      COMMAND sen::cli_gen cpp exports ${_export_args}
+       DEPENDS ${_gen_files} sen::cli_gen
+       WORKING_DIRECTORY ${_output_dir}
+       COMMENT "Generating exports sen code for ${_arg_TARGET}"
+diff --git a/docs/CMakeLists.txt b/docs/CMakeLists.txt
+index 6481bfc..0388664 100644
+--- a/docs/CMakeLists.txt
++++ b/docs/CMakeLists.txt
+@@ -36,28 +36,30 @@ if(mkdocs_exec)
+ ${sen_exec} --help > ${snippets_dir}/sen.sh\n\
+ \n\
+ ${sen_exec} run --help > ${snippets_dir}/sen_run.sh\n\
+-${sen_exec} fileToArray --help > ${snippets_dir}/sen_fileToArray.sh\n\
+-${sen_exec} gen --help > ${snippets_dir}/sen_gen.sh\n\
++${sen_exec} file-to-array --help > ${snippets_dir}/sen_file_to_array.sh\n\
++${sen_exec} completion --help > ${snippets_dir}/sen_completion.sh\n\
++${sen_exec} generate --help > ${snippets_dir}/sen_generate.sh\n\
+ \n\
+-${sen_exec} gen cpp --help > ${snippets_dir}/sen_gen_cpp.sh\n\
+-${sen_exec} gen cpp stl --help > ${snippets_dir}/sen_gen_cpp_stl.sh\n\
+-${sen_exec} gen cpp fom --help > ${snippets_dir}/sen_gen_cpp_fom.sh\n\
++${sen_exec} generate cpp --help > ${snippets_dir}/sen_generate_cpp.sh\n\
++${sen_exec} generate cpp stl --help > ${snippets_dir}/sen_generate_cpp_stl.sh\n\
++${sen_exec} generate cpp fom --help > ${snippets_dir}/sen_generate_cpp_fom.sh\n\
++${sen_exec} generate cpp exports --help > ${snippets_dir}/sen_generate_cpp_exports.sh\n\
+ \n\
+-${sen_exec} gen uml --help > ${snippets_dir}/sen_gen_uml.sh\n\
+-${sen_exec} gen uml stl --help > ${snippets_dir}/sen_gen_uml_stl.sh\n\
+-${sen_exec} gen uml fom --help > ${snippets_dir}/sen_gen_uml_fom.sh\n\
++${sen_exec} generate uml --help > ${snippets_dir}/sen_generate_uml.sh\n\
++${sen_exec} generate uml stl --help > ${snippets_dir}/sen_generate_uml_stl.sh\n\
++${sen_exec} generate uml fom --help > ${snippets_dir}/sen_generate_uml_fom.sh\n\
+ \n\
+-${sen_exec} gen mkdocs --help > ${snippets_dir}/sen_gen_mkdocs.sh\n\
+-${sen_exec} gen mkdocs stl --help > ${snippets_dir}/sen_gen_mkdocs_stl.sh\n\
+-${sen_exec} gen mkdocs fom --help > ${snippets_dir}/sen_gen_mkdocs_fom.sh\n\
++${sen_exec} generate mkdocs --help > ${snippets_dir}/sen_generate_mkdocs.sh\n\
++${sen_exec} generate mkdocs stl --help > ${snippets_dir}/sen_generate_mkdocs_stl.sh\n\
++${sen_exec} generate mkdocs fom --help > ${snippets_dir}/sen_generate_mkdocs_fom.sh\n\
+ \n\
+-${sen_exec} gen json package stl --help > ${snippets_dir}/sen_gen_json_package_stl.sh\n\
+-${sen_exec} gen json package fom --help > ${snippets_dir}/sen_gen_json_package_fom.sh\n\
++${sen_exec} generate json package stl --help > ${snippets_dir}/sen_generate_json_package_stl.sh\n\
++${sen_exec} generate json package fom --help > ${snippets_dir}/sen_generate_json_package_fom.sh\n\
+ \n\
+-${sen_exec} gen json component stl --help > ${snippets_dir}/sen_gen_json_component_stl.sh\n\
+-${sen_exec} gen json component fom --help > ${snippets_dir}/sen_gen_json_component_fom.sh\n\
++${sen_exec} generate json component stl --help > ${snippets_dir}/sen_generate_json_component_stl.sh\n\
++${sen_exec} generate json component fom --help > ${snippets_dir}/sen_generate_json_component_fom.sh\n\
+ \n\
+-${sen_exec} gen json schema --help > ${snippets_dir}/sen_gen_json_schema.sh\n\
++${sen_exec} generate json schema --help > ${snippets_dir}/sen_generate_json_schema.sh\n\
+ \n\
+ ${sen_exec} archive --help > ${snippets_dir}/sen_archive.sh\n\
+ ${sen_exec} archive indexed --help > ${snippets_dir}/sen_archive_indexed.sh\n\
+@@ -67,7 +69,7 @@ ${sen_exec} package --help > ${snippets_dir}/sen_package.sh\n\
+ ${sen_exec} package init --help > ${snippets_dir}/sen_package_init.sh\n\
+ ${sen_exec} package init-component --help > ${snippets_dir}/sen_package_init-component.sh\n\
+ \n\
+-${sen_exec} gen mkdocs fom --directories ${fom_base_dir}/rpr ${fom_base_dir}/netn ${fom_base_dir}/link16 -t \"Generated RPR, NETN & L16 Docs\" -o ${snippets_dir}/fom.md\n\
++${sen_exec} generate mkdocs fom --directories ${fom_base_dir}/rpr ${fom_base_dir}/netn ${fom_base_dir}/link16 -t \"Generated RPR, NETN & L16 Docs\" -o ${snippets_dir}/fom.md\n\
+ exit 0"
+       FILE_PERMISSIONS
+       OWNER_READ
+@@ -93,21 +95,31 @@ exit 0"
+   set(snippets
+       ${snippets_dir}/sen.sh
+       ${snippets_dir}/LICENSE.txt
++      ${snippets_dir}/sen_run.sh
++      ${snippets_dir}/sen_file_to_array.sh
++      ${snippets_dir}/sen_completion.sh
++      ${snippets_dir}/sen_generate.sh
++      ${snippets_dir}/sen_generate_cpp.sh
++      ${snippets_dir}/sen_generate_cpp_stl.sh
++      ${snippets_dir}/sen_generate_cpp_fom.sh
++      ${snippets_dir}/sen_generate_cpp_exports.sh
++      ${snippets_dir}/sen_generate_uml.sh
++      ${snippets_dir}/sen_generate_uml_stl.sh
++      ${snippets_dir}/sen_generate_uml_fom.sh
++      ${snippets_dir}/sen_generate_mkdocs.sh
++      ${snippets_dir}/sen_generate_mkdocs_stl.sh
++      ${snippets_dir}/sen_generate_mkdocs_fom.sh
++      ${snippets_dir}/sen_generate_json_package_stl.sh
++      ${snippets_dir}/sen_generate_json_package_fom.sh
++      ${snippets_dir}/sen_generate_json_component_stl.sh
++      ${snippets_dir}/sen_generate_json_component_fom.sh
++      ${snippets_dir}/sen_generate_json_schema.sh
+       ${snippets_dir}/sen_archive.sh
+       ${snippets_dir}/sen_archive_indexed.sh
+       ${snippets_dir}/sen_archive_info.sh
+-      ${snippets_dir}/sen_run.sh
+-      ${snippets_dir}/sen_gen.sh
+-      ${snippets_dir}/sen_gen_cpp.sh
+-      ${snippets_dir}/sen_gen_cpp_fom.sh
+-      ${snippets_dir}/sen_gen_cpp_stl.sh
+-      ${snippets_dir}/sen_gen_uml.sh
+-      ${snippets_dir}/sen_gen_uml_fom.sh
+-      ${snippets_dir}/sen_gen_uml_stl.sh
+       ${snippets_dir}/sen_package.sh
+       ${snippets_dir}/sen_package_init.sh
+       ${snippets_dir}/sen_package_init-component.sh
+-      ${snippets_dir}/sen_fileToArray.sh
+       ${fom_doc_example_file}
+   )
+ 
+diff --git a/docs/users_guide/command_line.md b/docs/users_guide/command_line.md
+index 6cac530..afbc2f2 100644
+--- a/docs/users_guide/command_line.md
++++ b/docs/users_guide/command_line.md
+@@ -298,58 +298,72 @@ build:
+ 
+ ## Code generator
+ 
+-```title="sen gen"
+---8<-- "snippets/sen_gen.sh"
++```title="sen generate"
++--8<-- "snippets/sen_generate.sh"
+ ```
+ 
+ ### C++
+ 
+-```title="sen gen cpp"
+---8<-- "snippets/sen_gen_cpp.sh"
++```title="sen generate cpp"
++--8<-- "snippets/sen_generate_cpp.sh"
+ ```
+ 
+ #### C++ from STL
+ 
+-```title="sen gen cpp stl"
+---8<-- "snippets/sen_gen_cpp_stl.sh"
++```title="sen generate cpp stl"
++--8<-- "snippets/sen_generate_cpp_stl.sh"
+ ```
+ 
+ #### C++ from HLA FOMs
+ 
+-```title="sen gen cpp fom"
+---8<-- "snippets/sen_gen_cpp_fom.sh"
++```title="sen generate cpp fom"
++--8<-- "snippets/sen_generate_cpp_fom.sh"
++```
++
++#### C++ exports
++
++```title="sen generate cpp exports"
++--8<-- "snippets/sen_generate_cpp_exports.sh"
+ ```
+ 
+ ### UML
+ 
+-Works the same way as C++, but with sightly different options.
++Works the same way as C++, but with slightly different options.
++
++```title="sen generate uml"
++--8<-- "snippets/sen_generate_uml.sh"
++```
+ 
+ #### UML from STL
+ 
+-```title="sen gen uml stl"
+---8<-- "snippets/sen_gen_uml_stl.sh"
++```title="sen generate uml stl"
++--8<-- "snippets/sen_generate_uml_stl.sh"
+ ```
+ 
+ #### UML from HLA FOMs
+ 
+-```title="sen gen uml fom"
+---8<-- "snippets/sen_gen_uml_fom.sh"
++```title="sen generate uml fom"
++--8<-- "snippets/sen_generate_uml_fom.sh"
+ ```
+ 
+ ### MKDocs markdown
+ 
+-Works the same way as C++, but with sightly different options.
++Works the same way as C++, but with slightly different options.
++
++```title="sen generate mkdocs"
++--8<-- "snippets/sen_generate_mkdocs.sh"
++```
+ 
+ #### MKDocs from STL
+ 
+-```title="sen gen uml stl"
+---8<-- "snippets/sen_gen_mkdocs_stl.sh"
++```title="sen generate mkdocs stl"
++--8<-- "snippets/sen_generate_mkdocs_stl.sh"
+ ```
+ 
+ #### MKDocs from HLA FOMs
+ 
+-```title="sen gen uml fom"
+---8<-- "snippets/sen_gen_mkdocs_fom.sh"
++```title="sen generate mkdocs fom"
++--8<-- "snippets/sen_generate_mkdocs_fom.sh"
+ ```
+ 
+ ### JSON schemas
+@@ -359,31 +373,31 @@ Generates json schemas from a Sen data model.
+ #### JSON schemas for Sen components from STL
+ 
+ ```
+---8<-- "snippets/sen_gen_json_component_stl.sh"
++--8<-- "snippets/sen_generate_json_component_stl.sh"
+ ```
+ 
+ #### JSON schemas for Sen components from HLA FOMs
+ 
+ ```
+---8<-- "snippets/sen_gen_json_component_fom.sh"
++--8<-- "snippets/sen_generate_json_component_fom.sh"
+ ```
+ 
+ #### JSON schemas for Sen packages from STL
+ 
+ ```
+---8<-- "snippets/sen_gen_json_package_stl.sh"
++--8<-- "snippets/sen_generate_json_package_stl.sh"
+ ```
+ 
+ #### JSON schemas for Sen packages from HLA FOMs
+ 
+ ```
+---8<-- "snippets/sen_gen_json_package_fom.sh"
++--8<-- "snippets/sen_generate_json_package_fom.sh"
+ ```
+ 
+ #### Combine multiple JSON schemas to create a kernel configuration schema
+ 
+ ```
+---8<-- "snippets/sen_gen_json_schema.sh"
++--8<-- "snippets/sen_generate_json_schema.sh"
+ ```
+ 
+ ## Archiving Utility
+@@ -426,6 +440,59 @@ Helps you interact with archives.
+ 
+ ## File to array utility
+ 
+-```title="sen fileToArray"
+---8<-- "snippets/sen_fileToArray.sh"
++```title="sen file-to-array"
++--8<-- "snippets/sen_file_to_array.sh"
++```
++
++## Shell completion
++
++Sen can emit completion scripts for `bash`, `zsh`, `fish`, and PowerShell. The
++scripts are self-contained: once installed they do not invoke `sen` at
++runtime, so completion stays fast even on cold shells.
++
++```title="sen completion"
++--8<-- "snippets/sen_completion.sh"
++```
++
++### bash
++
++`bash` completion requires **bash 4 or newer** (associative arrays). This is
++the default on most modern distributions; older systems will need an upgrade.
++
++```bash
++# system-wide (requires the bash-completion package)
++sen completion bash > /etc/bash_completion.d/sen
++
++# or for the current user only
++sen completion bash > ~/.local/share/bash-completion/completions/sen
++```
++
++### zsh
++
++```zsh
++# ensure a user-owned completions directory is on your $fpath
++mkdir -p "${HOME}/.zsh/completions"
++sen completion zsh > "${HOME}/.zsh/completions/_sen"
++
++# then in ~/.zshrc
++fpath=(~/.zsh/completions $fpath)
++autoload -Uz compinit && compinit
++```
++
++### fish
++
++```fish
++sen completion fish > ~/.config/fish/completions/sen.fish
++```
++
++Fish picks up the new completions on its next shell start; run
++`fish_update_completions` or start a fresh shell to see them immediately.
++
++### PowerShell
++
++```powershell
++sen completion powershell | Out-String | Invoke-Expression
++
++# to make it persistent, append it to your profile
++sen completion powershell >> $PROFILE
+ ```
+diff --git a/libs/core/CMakeLists.txt b/libs/core/CMakeLists.txt
+index 27016d8..4bef62a 100644
+--- a/libs/core/CMakeLists.txt
++++ b/libs/core/CMakeLists.txt
+@@ -41,6 +41,7 @@ set(base_public_headers
+     include/sen/core/base/source_location.h
+     include/sen/core/base/span.h
+     include/sen/core/base/static_vector.h
++    include/sen/core/base/string_case.h
+     include/sen/core/base/strong_type.h
+     include/sen/core/base/timestamp.h
+     include/sen/core/base/type_traits_extra.h
+@@ -57,10 +58,11 @@ set(base_sources
+     src/base/assert.cpp
+     src/base/checked_conversions.cpp
+     src/base/hash32.cpp
+-    src/base/result_impl.cpp
+-    src/base/uuid.cpp
+     src/base/memory_block.cpp
++    src/base/result_impl.cpp
++    src/base/string_case.cpp
+     src/base/timestamp.cpp
++    src/base/uuid.cpp
+ )
+ 
+ # -------------------------------------------------------------------------------------------------------------
+diff --git a/libs/core/include/sen/core/base/string_case.h b/libs/core/include/sen/core/base/string_case.h
+new file mode 100644
+index 0000000..d536d42
+--- /dev/null
++++ b/libs/core/include/sen/core/base/string_case.h
+@@ -0,0 +1,40 @@
++// === string_case.h ==================================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#ifndef SEN_CORE_BASE_STRING_CASE_H
++#define SEN_CORE_BASE_STRING_CASE_H
++
++// std
++#include <string>
++#include <string_view>
++
++namespace sen
++{
++
++/// Flattens an identifier by dropping '-' and '_' separators and uppercases the first
++/// character of the result. On snake_case input like "foo_bar" returns "Foobar", not
++/// "FooBar": internal word boundaries are not re-capitalized. Use toPascalCase for the
++/// word-splitting behavior. Empty input returns empty.
++[[nodiscard]] std::string toUpperCamelCase(std::string_view str);
++
++/// Converts a snake_case identifier to PascalCase by splitting on underscores and capitalizing
++/// the first character of each word. "foo_bar" returns "FooBar"; "option_type" returns
++/// "OptionType". Non-underscore separators are copied through. Prefer this over
++/// toUpperCamelCase when the input is known to be snake_case.
++[[nodiscard]] std::string toPascalCase(std::string_view str);
++
++/// Converts an UpperCamelCase identifier to snake_case: each uppercase letter not at the start
++/// is preceded by an underscore and lowercased. Non-letters are copied through.
++[[nodiscard]] std::string toSnakeCase(std::string_view str);
++
++/// Returns true when str starts with an uppercase letter and contains no whitespace or
++/// underscores. Empty input is treated as valid.
++[[nodiscard]] bool isUpperCamelCase(std::string_view str);
++
++}  // namespace sen
++
++#endif  // SEN_CORE_BASE_STRING_CASE_H
+diff --git a/libs/core/src/base/string_case.cpp b/libs/core/src/base/string_case.cpp
+new file mode 100644
+index 0000000..aebff09
+--- /dev/null
++++ b/libs/core/src/base/string_case.cpp
+@@ -0,0 +1,107 @@
++// === string_case.cpp ================================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#include "sen/core/base/string_case.h"
++
++// sen
++#include "sen/core/base/checked_conversions.h"
++
++// std
++#include <cctype>
++#include <cstddef>
++#include <string>
++#include <string_view>
++
++namespace sen
++{
++
++std::string toUpperCamelCase(std::string_view str)
++{
++  std::string result;
++  result.reserve(str.size());
++  for (const auto c: str)
++  {
++    if (c != '-' && c != '_')
++    {
++      result.push_back(c);
++    }
++  }
++  if (!result.empty())
++  {
++    result.front() =
++      std_util::checkedConversion<char>(std::toupper(static_cast<unsigned char>(result.front())));
++  }
++  return result;
++}
++
++std::string toPascalCase(std::string_view str)
++{
++  std::string result;
++  result.reserve(str.size());
++  bool capitalizeNext = true;
++  for (const auto ch: str)
++  {
++    if (ch == '_')
++    {
++      capitalizeNext = true;
++      continue;
++    }
++    const auto c = static_cast<unsigned char>(ch);
++    if (capitalizeNext)
++    {
++      result.push_back(std_util::checkedConversion<char>(std::toupper(c)));
++      capitalizeNext = false;
++    }
++    else
++    {
++      result.push_back(ch);
++    }
++  }
++  return result;
++}
++
++std::string toSnakeCase(std::string_view str)
++{
++  std::string result;
++  result.reserve(str.size() * 2U);
++  for (std::size_t i = 0; i < str.size(); ++i)
++  {
++    const auto c = static_cast<unsigned char>(str[i]);
++    if (std::isupper(c) != 0)
++    {
++      if (i != 0)
++      {
++        result.push_back('_');
++      }
++      result.push_back(std_util::checkedConversion<char>(std::tolower(c)));
++    }
++    else
++    {
++      result.push_back(str[i]);
++    }
++  }
++  return result;
++}
++
++bool isUpperCamelCase(std::string_view str)
++{
++  if (str.empty())
++  {
++    return true;
++  }
++  if (std::islower(static_cast<unsigned char>(str.front())) != 0)
++  {
++    return false;
++  }
++  if (str.find_first_of(' ') != std::string_view::npos)
++  {
++    return false;
++  }
++  return str.find_first_of('_') == std::string_view::npos;
++}
++
++}  // namespace sen
+diff --git a/libs/core/src/lang/fom_document_set.cpp b/libs/core/src/lang/fom_document_set.cpp
+index 03f6457..88c6f69 100644
+--- a/libs/core/src/lang/fom_document_set.cpp
++++ b/libs/core/src/lang/fom_document_set.cpp
+@@ -9,6 +9,7 @@
+ 
+ // sen
+ #include "sen/core/base/assert.h"
++#include "sen/core/base/string_case.h"
+ #include "sen/core/io/util.h"
+ #include "sen/core/lang/stl_resolver.h"
+ #include "sen/core/meta/alias_type.h"
+@@ -99,31 +100,6 @@ void collectInteractionNodes(pugi::xml_node node, std::vector<pugi::xml_node>& r
+          std::find_if(s.begin(), s.end(), [](unsigned char c) { return std::isdigit(c) == 0; }) == s.end();
+ }
+ 
+-[[nodiscard]] std::string toUpperCamelCase(const std::string& str)
+-{
+-  if (str.empty())
+-  {
+-    return str;
+-  }
+-
+-  std::string result;
+-  result.reserve(str.size());
+-
+-  for (const auto& elem: str)
+-  {
+-    if (elem != '-' && elem != '_')
+-    {
+-      result.append(1U, elem);
+-    }
+-  }
+-
+-  if (!result.empty())
+-  {
+-    result.front() = static_cast<char>(std::toupper(result.front()));
+-  }
+-  return result;
+-}
+-
+ std::vector<std::string_view> splitString(const std::string_view input, const std::string_view delimiters)
+ {
+   std::vector<std::string_view> result;
+diff --git a/libs/core/test/CMakeLists.txt b/libs/core/test/CMakeLists.txt
+index ca2a26a..f0907c1 100644
+--- a/libs/core/test/CMakeLists.txt
++++ b/libs/core/test/CMakeLists.txt
+@@ -21,6 +21,7 @@ set(base_tests
+     base/source_location_test.cpp
+     base/span_test.cpp
+     base/static_vector_test.cpp
++    base/string_case_test.cpp
+     base/timestamp_test.cpp
+ )
+ 
+diff --git a/libs/core/test/base/string_case_test.cpp b/libs/core/test/base/string_case_test.cpp
+new file mode 100644
+index 0000000..8883de1
+--- /dev/null
++++ b/libs/core/test/base/string_case_test.cpp
+@@ -0,0 +1,67 @@
++// === string_case_test.cpp ===========================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#include "sen/core/base/string_case.h"
++
++// google test
++#include <gtest/gtest.h>
++
++namespace sen
++{
++
++/// @test
++/// toUpperCamelCase strips separators and uppercases the first character.
++TEST(StringCaseTest, toUpperCamelCaseBasicConversion)
++{
++  EXPECT_EQ(toUpperCamelCase(""), "");
++  EXPECT_EQ(toUpperCamelCase("foo"), "Foo");
++  EXPECT_EQ(toUpperCamelCase("foo-bar"), "Foobar");
++  EXPECT_EQ(toUpperCamelCase("foo_bar"), "Foobar");
++  EXPECT_EQ(toUpperCamelCase("FooBar"), "FooBar");
++}
++
++/// @test
++/// toPascalCase treats underscores as word separators and capitalizes each word's first
++/// character, in contrast with toUpperCamelCase which only capitalizes the leading character.
++TEST(StringCaseTest, toPascalCaseBasicConversion)
++{
++  EXPECT_EQ(toPascalCase(""), "");
++  EXPECT_EQ(toPascalCase("foo"), "Foo");
++  EXPECT_EQ(toPascalCase("foo_bar"), "FooBar");
++  EXPECT_EQ(toPascalCase("option_type"), "OptionType");
++  EXPECT_EQ(toPascalCase("already_PascalCase"), "AlreadyPascalCase");
++}
++
++/// @test
++/// toSnakeCase inserts underscores before every uppercase letter except the first, and
++/// lowercases the full result.
++TEST(StringCaseTest, toSnakeCaseBasicConversion)
++{
++  EXPECT_EQ(toSnakeCase(""), "");
++  EXPECT_EQ(toSnakeCase("Foo"), "foo");
++  EXPECT_EQ(toSnakeCase("FooBar"), "foo_bar");
++  EXPECT_EQ(toSnakeCase("MyHttpServer"), "my_http_server");
++  EXPECT_EQ(toSnakeCase("alreadyLower"), "already_lower");
++}
++
++/// @test
++/// isUpperCamelCase accepts names that start with uppercase and contain no spaces or
++/// underscores, and rejects everything else.
++TEST(StringCaseTest, isUpperCamelCaseAcceptance)
++{
++  EXPECT_TRUE(isUpperCamelCase(""));
++  EXPECT_TRUE(isUpperCamelCase("Foo"));
++  EXPECT_TRUE(isUpperCamelCase("FooBar"));
++  EXPECT_TRUE(isUpperCamelCase("A"));
++
++  EXPECT_FALSE(isUpperCamelCase("foo"));
++  EXPECT_FALSE(isUpperCamelCase("fooBar"));
++  EXPECT_FALSE(isUpperCamelCase("Foo Bar"));
++  EXPECT_FALSE(isUpperCamelCase("Foo_Bar"));
++}
++
++}  // namespace sen
+-- 
+2.51.0
+
