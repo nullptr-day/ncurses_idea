@@ -1,0 +1,124 @@
+From 5375c74e32d7491ec41396ead592ac5f5c55f96e Mon Sep 17 00:00:00 2001
+From: Enrique Parodi Spalazzi <enrique.parodi@airbus.com>
+Date: Fri, 24 Apr 2026 00:19:39 +0200
+Subject: [PATCH 08/10] chore[term]: misc cleanups and portability fixes
+
+Four small unrelated improvements bundled for reviewability:
+
+- Drop the unused leafCountIn helper in arg_form.
+- Avoid a C++20 structured-binding capture in the
+  command_engine_watch onObjectAdded lambda; replace with a manual
+  unpack so 'key' is a real variable before the lambda captures it.
+- Spell out protocol names in the 'version' command output:
+  'kernel: 9, transport: 2' instead of the cryptic '9k - 2t'.
+- Swap the heartbeat glyph in the status bar from the heart suits
+  (U+2661 / U+2665) to hollow / filled circles (U+25CB / U+25CF).
+  The white-heart codepoint is missing from many coding fonts and
+  rendered as tofu on some terminals; the circles are in
+  CP437-derived fonts and in Unicode-coverage-complete ones. The
+  constants rename from heart* to beat* so the intent outlives the
+  glyph choice.
+---
+ components/term/src/arg_form.cpp               | 16 ----------------
+ components/term/src/command_engine_inspect.cpp |  4 ++--
+ components/term/src/command_engine_watch.cpp   |  6 +++++-
+ components/term/src/status_bar.cpp             |  2 +-
+ components/term/src/unicode.h                  |  7 ++++---
+ 5 files changed, 12 insertions(+), 23 deletions(-)
+
+diff --git a/components/term/src/arg_form.cpp b/components/term/src/arg_form.cpp
+index c5edf2c..11344e5 100644
+--- a/components/term/src/arg_form.cpp
++++ b/components/term/src/arg_form.cpp
+@@ -1604,22 +1604,6 @@ std::size_t firstLeafOf(const std::vector<ArgFormField*>& leaves, const ArgFormF
+   return noIndex;
+ }
+ 
+-/// Leaf count in a subtree.
+-std::size_t leafCountIn(const ArgFormField& f)
+-{
+-  if (f.isLeaf())
+-  {
+-    return 1;
+-  }
+-  std::size_t n = 0;
+-  for (const auto& c: f.children)
+-  {
+-    n += leafCountIn(c);
+-  }
+-  return n;
+-}
+-
+-/// {parentSeq, indexWithinParent} or nullopt.
+ }  // namespace
+ 
+ void ArgForm::addElementToFocusedSequence()
+diff --git a/components/term/src/command_engine_inspect.cpp b/components/term/src/command_engine_inspect.cpp
+index e478bed..40c01d3 100644
+--- a/components/term/src/command_engine_inspect.cpp
++++ b/components/term/src/command_engine_inspect.cpp
+@@ -547,10 +547,10 @@ void CommandEngine::cmdVersion(std::string_view /*args*/)
+ 
+   {
+     auto transportVersion = api_.getTransportProtocolVersion();
+-    std::string protocols = std::to_string(kernel::getKernelProtocolVersion()) + "k";
++    std::string protocols = "kernel: " + std::to_string(kernel::getKernelProtocolVersion());
+     if (transportVersion.has_value())
+     {
+-      protocols += " - " + std::to_string(*transportVersion) + "t";
++      protocols += ", transport: " + std::to_string(*transportVersion);
+     }
+ 
+     std::string kernelSummary = std::string(SEN_VERSION_STRING) + " " + build.compiler
+diff --git a/components/term/src/command_engine_watch.cpp b/components/term/src/command_engine_watch.cpp
+index 8e5d7b4..f2d7425 100644
+--- a/components/term/src/command_engine_watch.cpp
++++ b/components/term/src/command_engine_watch.cpp
+@@ -574,8 +574,12 @@ void CommandEngine::onObjectAdded(const std::shared_ptr<Object>& obj)
+ {
+   std::vector<std::string> pendingAllKeys;
+ 
+-  for (auto& [key, watch]: watches_)
++  // Manual unpack instead of `auto& [key, watch]` because the lambda below captures `key`
++  // by value, and C++17 does not permit capturing structured-binding names.
++  for (auto& entry: watches_)
+   {
++    const auto& key = entry.first;
++    auto&       watch = entry.second;
+     if (watch.object.lock() != nullptr)
+     {
+       continue;
+diff --git a/components/term/src/status_bar.cpp b/components/term/src/status_bar.cpp
+index 8771f63..bce781d 100644
+--- a/components/term/src/status_bar.cpp
++++ b/components/term/src/status_bar.cpp
+@@ -78,7 +78,7 @@ ftxui::Element renderStatusBar(const StatusBarData& data)
+     auto nowSec = std::chrono::duration_cast<std::chrono::seconds>(
+                     std::chrono::system_clock::now().time_since_epoch())
+                     .count();
+-    const auto* beat = (nowSec % 2 == 0) ? unicode::heartBig : unicode::heartSmall;
++    const auto* beat = (nowSec % 2 == 0) ? unicode::beatOn : unicode::beatOff;
+     left.push_back(text(" "));
+     left.push_back(text(beat) | barAccent());
+   }
+diff --git a/components/term/src/unicode.h b/components/term/src/unicode.h
+index e415800..45d2f97 100644
+--- a/components/term/src/unicode.h
++++ b/components/term/src/unicode.h
+@@ -41,9 +41,10 @@ constexpr auto* paneLogs       = "\u2261";      // ≡
+ constexpr auto* paneEvents     = "\u2726";      // ✦
+ constexpr auto* paneWatches    = "\u2299";      // ⊙
+ 
+-// Heartbeat (1 Hz beat in the status bar)
+-constexpr auto* heartSmall     = "\u2661";      // ♡
+-constexpr auto* heartBig       = "\u2665";      // ♥
++// Heartbeat (1 Hz beat in the status bar). Filled / hollow circles rather than heart
++// suits because the white-heart codepoint (U+2661) is missing from many coding fonts.
++constexpr auto* beatOff        = "\u25CB";      // ○
++constexpr auto* beatOn         = "\u25CF";      // ●
+ 
+ // Status markers
+ constexpr auto* check          = "\u2713";      // ✓
+-- 
+2.51.0
+

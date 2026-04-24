@@ -1,0 +1,148 @@
+From a105489b04248c7744b2248c9cda335701b4e78b Mon Sep 17 00:00:00 2001
+From: Enrique Parodi Spalazzi <enrique.parodi@airbus.com>
+Date: Fri, 24 Apr 2026 00:19:55 +0200
+Subject: [PATCH 09/10] fix[term]: k9s-style ESC behavior with double-press
+ confirmation
+
+Previously a single ESC shut the app down unconditionally, which is
+easy to hit by accident when the user meant to cancel a half-typed
+command. Switch to the k9s pattern:
+
+- ESC with content in the buffer: discard the input (clears the
+  buffer, cursor, error-reveal, and completion cycle).
+- ESC on an empty buffer: arm a confirmation row under the prompt
+  ('Press ESC again to exit - any other key to cancel').
+- A second ESC while armed: shutdown.
+- Any other user-input key while armed: dismiss the confirmation and
+  let the key perform its normal action.
+
+Ctrl+D stays the direct exit path for power users.
+
+The 500 ms safety-net redraw posts ftxui::Event::Custom, which would
+flow through the 'any other key cancels' block and clear the armed
+state before the user could press ESC a second time. Restrict the
+dismissal to real keyboard input: Custom, mouse, and cursor-response
+events no longer count, so the confirmation row survives idle
+redraws.
+---
+ components/term/src/app.cpp | 69 ++++++++++++++++++++++++++++++++++---
+ 1 file changed, 64 insertions(+), 5 deletions(-)
+
+diff --git a/components/term/src/app.cpp b/components/term/src/app.cpp
+index 8469379..3f81021 100644
+--- a/components/term/src/app.cpp
++++ b/components/term/src/app.cpp
+@@ -112,6 +112,12 @@ struct App::UiState
+   bool        revealErrors = false;
+   std::string revealedBuffer;
+ 
++  // Quit-confirmation state. ESC on a non-empty input discards the buffer (k9s-style
++  // "back / cancel"); ESC on an empty input arms this flag, which displays a confirmation
++  // row under the prompt; a second ESC then shuts the app down. Any other key dismisses
++  // the armed state (no timeout: the confirmation sticks until the user resolves it).
++  bool exitConfirmPending = false;
++
+   void clearCompletion()
+   {
+     completionCandidates.clear();
+@@ -715,8 +721,9 @@ ftxui::Component App::createInputComponent()
+ 
+           // Inline ghost hint rendered after the cursor on the last visual line, only when
+           // there's enough room. Priority order:
+-          //   1. tab-completion action ("⏎args" / "⏎run") — user has a pending choice.
+-          //   2. grammar hint (e.g. "`FROM`") — the parser's expected next token.
++          //   1. tab-completion action ("args" / "run" with a return marker): user has a
++          //      pending choice.
++          //   2. grammar hint (e.g. "`FROM`"): the parser's expected next token.
+           // Error messages are intentionally not in this chain: they are typically too
+           // long to fit after the query and get their own row below the input (see the
+           // dedicated error row appended after this loop).
+@@ -732,7 +739,8 @@ ftxui::Component App::createInputComponent()
+             int         ghostCells = 0;
+             if (!ui_->completionHintAction.empty())
+             {
+-              // "  " + ⏎ (3 bytes, 1 cell) + action word (ASCII).
++              // Two leading spaces, then the return-symbol glyph (3 bytes, 1 cell), then
++              // the action word (ASCII).
+               ghost = std::string("  ") + unicode::returnSymbol + ui_->completionHintAction;
+               ghostCells = 3 + checkedConversion<int>(ui_->completionHintAction.size());
+             }
+@@ -767,6 +775,15 @@ ftxui::Component App::createInputComponent()
+                                       ftxui::text(errorHint) | styles::errorMessage()}));
+         }
+ 
++        // Quit confirmation row: one ESC on an empty buffer arms this; a second ESC
++        // shuts down; any other key cancels.
++        if (ui_->exitConfirmPending)
++        {
++          rows.push_back(ftxui::hbox({ftxui::text("  "),
++                                      ftxui::text("Press ESC again to exit · any other key to cancel") |
++                                        styles::mutedText()}));
++        }
++
+         return ftxui::vbox(std::move(rows));
+       }),
+     [this](const ftxui::Event& event) -> bool
+@@ -1317,8 +1334,8 @@ bool App::handleCompletionEvent(ftxui::Event event)
+ 
+ bool App::handleGlobalEvent(ftxui::Event event)
+ {
+-  if ((event == ftxui::Event::Escape && ui_->completionCandidates.empty()) ||
+-      event == ftxui::Event::Special({4}))  // Escape or Ctrl+D
++  // Ctrl+D is the direct, power-user exit path. Never gated by confirmation.
++  if (event == ftxui::Event::Special({4}))
+   {
+     appendInfo("Shutting down...");
+     exited_ = true;
+@@ -1326,6 +1343,48 @@ bool App::handleGlobalEvent(ftxui::Event event)
+     return true;
+   }
+ 
++  // k9s-style ESC handling: cancel the current context, then require a second press to
++  // quit from the top level. Form-active and completion-active ESCs are already consumed
++  // higher up in the dispatch chain, so here ESC always talks to the input pane.
++  if (event == ftxui::Event::Escape)
++  {
++    auto& buf = ui_->inputPane.getBuffer();
++    if (!buf.empty())
++    {
++      // Non-empty buffer: discard input. Also clear any transient UI state that the
++      // buffer drove (error-reveal, completion cycle) so the user sees a clean prompt.
++      buf.clear();
++      ui_->cursorPos = 0;
++      ui_->revealErrors = false;
++      ui_->exitConfirmPending = false;
++      ui_->clearCompletion();
++      requestRedraw();
++      return true;
++    }
++    if (ui_->exitConfirmPending)
++    {
++      appendInfo("Shutting down...");
++      exited_ = true;
++      shutdownRequested_ = true;
++      return true;
++    }
++    ui_->exitConfirmPending = true;
++    requestRedraw();
++    return true;
++  }
++
++  // Any other user-input key dismisses an armed quit confirmation. Fall through so the
++  // key performs its normal action. Internal events (the ~500 ms safety-net redraw posted
++  // via Event::Custom, mouse events, cursor-position / shape responses from the terminal)
++  // must not count as dismissal, or the confirmation row would flash away almost
++  // immediately.
++  if (ui_->exitConfirmPending && event != ftxui::Event::Custom && !event.is_mouse() &&
++      !event.is_cursor_position() && !event.is_cursor_shape())
++  {
++    ui_->exitConfirmPending = false;
++    requestRedraw();
++  }
++
+   if (event == ftxui::Event::F1)
+   {
+     if (onCommand_)
+-- 
+2.51.0
+

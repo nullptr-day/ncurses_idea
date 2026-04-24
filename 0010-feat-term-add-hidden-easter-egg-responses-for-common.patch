@@ -1,0 +1,192 @@
+From 3902af18d640d77f44ded0976a876163255a868e Mon Sep 17 00:00:00 2001
+From: Enrique Parodi Spalazzi <enrique.parodi@airbus.com>
+Date: Fri, 24 Apr 2026 00:20:12 +0200
+Subject: [PATCH 10/10] feat[term]: add hidden easter-egg responses for common
+ slips
+
+A small table of playful redirects for inputs that would otherwise
+fall through to the unknown-command error. None of the entries
+appear in 'help', Tab completion, or 'help <egg>' -- they only
+surface when a user actually types the trigger.
+
+Two priority tiers:
+
+- Full-input phrases (42, xyzzy) are checked before the dispatcher so
+  their first word can be a real command (none of these currently
+  are, but the priority is preserved for future entries).
+- Command-token fallbacks run after the dispatcher and after
+  object-method resolution, so a legitimate command or method is
+  never shadowed. Covers muscle-memory slips from: Windows shells
+  (dir, cls), Unix shells (man, whoami, cat, grep, ll, la, cd..,
+  ..), Python / Node REPLs (exit(), quit(), quit), vim (:q, :q!,
+  :wq, :help), editor names (vim, vi, nano, emacs), other tools
+  (git, bash, sh), plus authority (sudo), destructive (rm), and
+  friendly greetings (hello, hi, thanks).
+---
+ components/term/src/command_engine.cpp | 134 +++++++++++++++++++++++--
+ 1 file changed, 125 insertions(+), 9 deletions(-)
+
+diff --git a/components/term/src/command_engine.cpp b/components/term/src/command_engine.cpp
+index f828285..a249536 100644
+--- a/components/term/src/command_engine.cpp
++++ b/components/term/src/command_engine.cpp
+@@ -57,6 +57,102 @@ namespace sen::components::term
+ 
+ using sen::std_util::checkedConversion;
+ 
++namespace
++{
++
++/// Hidden replies to specific inputs. Two modes:
++///   fullInput != nullptr : match the entire trimmed input verbatim.
++///   cmdToken != nullptr  : match the command token alone (first whitespace-delimited word).
++/// Full-input entries are tried before the command dispatcher so phrases that share their
++/// first word with a real command ("open the pod bay doors") still fire. Command-token
++/// entries are tried after the dispatcher and after object-method resolution, so a real
++/// command or method can never be shadowed.
++struct Egg
++{
++  const char* cmdToken  = nullptr;
++  const char* fullInput = nullptr;
++  const char* response  = nullptr;
++};
++
++constexpr Egg eggs[] = {
++  // Full-input phrases. Kept to a minimum: only short, iconic triggers a user might
++  // plausibly type on a dare. They run before the dispatcher so their first word can
++  // be a real command (none of these currently are, but the priority is preserved
++  // for future entries like `open the pod bay doors`).
++  {nullptr, "42",     "42. But what was the question?"},
++  {nullptr, "xyzzy",  "Nothing happens."},
++
++  // Command-token entries. These catch common muscle-memory slips from other tools
++  // and redirect the user to the real equivalent. Tried after the dispatcher and
++  // after object-method resolution, so a legitimate command or method is never
++  // shadowed.
++
++  // Windows-shell habits.
++  {"dir",     nullptr, "Not Windows. Use 'ls'."},
++  {"cls",     nullptr, "Not Windows. Use 'clear'."},
++
++  // Unix-shell habits.
++  {"man",     nullptr, "No manpages here. Try 'help <command>'."},
++  {"whoami",  nullptr, "See 'status' for your session and scope."},
++  {"cat",     nullptr, "Try 'inspect <object>' to see its state."},
++  {"grep",    nullptr, "Try 'query' for SQL-filtered views, or Tab for completions."},
++  {"ll",      nullptr, "No bash aliases here. Use 'ls'."},
++  {"la",      nullptr, "No bash aliases here. Use 'ls'."},
++  {"cd..",    nullptr, "Use 'cd ..' with a space."},
++  {"..",      nullptr, "Use 'cd ..' to go up."},
++
++  // Python / Node REPL habits.
++  {"exit()",  nullptr, "Python habits. Use 'exit'."},
++  {"quit()",  nullptr, "Same: try 'exit'."},
++  {"quit",    nullptr, "Use 'exit' or Ctrl+D."},
++
++  // Vim habits.
++  {":q",      nullptr, "Not vim. Use 'exit' or Ctrl+D."},
++  {":q!",     nullptr, "Still not vim."},
++  {":wq",     nullptr, "Nothing to save. And still not vim."},
++  {":help",   nullptr, "No colons. Try 'help'."},
++
++  // Typing an editor's name at the prompt.
++  {"vim",     nullptr, "No editor here. Try 'inspect <object>' for a read-only view."},
++  {"vi",      nullptr, "No editor here. Try 'inspect <object>' for a read-only view."},
++  {"nano",    nullptr, "No editor here. Try 'inspect <object>' for a read-only view."},
++  {"emacs",   nullptr, "No editor here. Try 'inspect <object>' for a read-only view."},
++
++  // Typing another tool's name.
++  {"git",     nullptr, "Not a git shell. Try 'help'."},
++  {"bash",    nullptr, "You are already in a shell of sorts."},
++  {"sh",      nullptr, "You are already in a shell of sorts."},
++
++  // Authority / destructive.
++  {"sudo",    nullptr, "This shell does not bow to sudo."},
++  {"rm",      nullptr, "No destruction here. Try 'query rm' or 'unwatch'."},
++
++  // Friendly.
++  {"hello",   nullptr, "Hi. Type 'help' to get started."},
++  {"hi",      nullptr, "Hi. Type 'help' to get started."},
++  {"thanks",  nullptr, "Anytime."},
++};
++
++[[nodiscard]] const char* tryEggFullInput(std::string_view input) noexcept
++{
++  for (const auto& e: eggs)
++  {
++    if (e.fullInput != nullptr && input == e.fullInput) { return e.response; }
++  }
++  return nullptr;
++}
++
++[[nodiscard]] const char* tryEggCmdToken(std::string_view cmd) noexcept
++{
++  for (const auto& e: eggs)
++  {
++    if (e.cmdToken != nullptr && cmd == e.cmdToken) { return e.response; }
++  }
++  return nullptr;
++}
++
++}  // namespace
++
+ //--------------------------------------------------------------------------------------------------------------
+ // CommandCategory
+ //--------------------------------------------------------------------------------------------------------------
+@@ -384,7 +480,17 @@ void CommandEngine::execute(std::string_view input)
+ 
+   auto [cmd, args] = splitCommand(input);
+ 
+-  if (cmd == "?")
++  // Full-input easter eggs run before the dispatcher so puns like `open the pod bay
++  // doors` win against the real `open` command. Handled here so they still get the
++  // normal post-processing (blank-line separator, status refresh).
++  const char* fullEgg = tryEggFullInput(input);
++
++  if (fullEgg != nullptr)
++  {
++    echoCommand(input);
++    app_.appendInfo(fullEgg);
++  }
++  else if (cmd == "?")
+   {
+     echoCommand(input);
+     cmdHelp(args);
+@@ -414,16 +520,26 @@ void CommandEngine::execute(std::string_view input)
+     }
+     else if (!tryResolveObjectMethod(input, cmd, args))
+     {
+-      echoCommand(input, /*isError=*/true);
+-      std::string message = "'" + std::string(cmd) + "' is not a recognized command.";
+-      auto names = builtInCommandNames(app_.displayMode());
+-      auto hint = formatSuggestionHint(findSuggestions(cmd, names));
+-      if (!hint.empty())
++      // Command-token easter eggs run after the dispatcher + object-method resolution so
++      // a real command or method can never be shadowed.
++      if (const auto* egg = tryEggCmdToken(cmd); egg != nullptr)
++      {
++        echoCommand(input);
++        app_.appendInfo(egg);
++      }
++      else
+       {
+-        message += "\n" + hint;
++        echoCommand(input, /*isError=*/true);
++        std::string message = "'" + std::string(cmd) + "' is not a recognized command.";
++        auto names = builtInCommandNames(app_.displayMode());
++        auto hint = formatSuggestionHint(findSuggestions(cmd, names));
++        if (!hint.empty())
++        {
++          message += "\n" + hint;
++        }
++        message += "\nType 'help' for a list of available commands.";
++        reportError("Unknown Command", message);
+       }
+-      message += "\nType 'help' for a list of available commands.";
+-      reportError("Unknown Command", message);
+     }
+   }
+ 
+-- 
+2.51.0
+
