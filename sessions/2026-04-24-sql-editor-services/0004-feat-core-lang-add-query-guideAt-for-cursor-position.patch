@@ -1,0 +1,1350 @@
+From 063a3e0710798faf80b0aeb684ebbce4c0ed7fd4 Mon Sep 17 00:00:00 2001
+From: Enrique Parodi Spalazzi <enrique.parodi@airbus.com>
+Date: Fri, 24 Apr 2026 00:18:17 +0200
+Subject: [PATCH 04/10] feat[core/lang]: add query::guideAt() for
+ cursor-position hints
+
+Grammar-only guidance for tools that want an inline ghost hint next to
+the cursor ("a class name", "\`FROM\`", "a comparison operator, \`AND\`,
+\`OR\`, \`BETWEEN\`, \`IN\`, or \`NOT\`", ...) without consulting the
+type registry. Returns a GuidanceShape enum plus a default
+human-readable hint; editors that localize can ignore the string and
+derive their own from the shape.
+
+The positional FSM that drove complete() is extracted into a private
+fsm.h/fsm.cpp so complete and guideAt share the same walk rather than
+drifting apart.
+
+Two small hint-text fixups bundled in:
+- Drop the "expected " prefix from guidance strings. They are labels,
+  not complaints.
+- Drop the optional \`.\` from the classPathTail hint. Completion
+  delivers fully qualified class names in one shot, so the user never
+  needs to type the inter-segment dot manually.
+---
+ libs/core/CMakeLists.txt                      |   4 +
+ libs/core/include/sen/core/lang/query/guide.h |  69 +++
+ libs/core/src/lang/query/complete.cpp         | 396 +-----------------
+ libs/core/src/lang/query/fsm.cpp              | 376 +++++++++++++++++
+ libs/core/src/lang/query/fsm.h                |  93 ++++
+ libs/core/src/lang/query/guide.cpp            | 112 +++++
+ libs/core/test/CMakeLists.txt                 |   1 +
+ libs/core/test/lang/query/guide_test.cpp      | 166 ++++++++
+ 8 files changed, 831 insertions(+), 386 deletions(-)
+ create mode 100644 libs/core/include/sen/core/lang/query/guide.h
+ create mode 100644 libs/core/src/lang/query/fsm.cpp
+ create mode 100644 libs/core/src/lang/query/fsm.h
+ create mode 100644 libs/core/src/lang/query/guide.cpp
+ create mode 100644 libs/core/test/lang/query/guide_test.cpp
+
+diff --git a/libs/core/CMakeLists.txt b/libs/core/CMakeLists.txt
+index 9eee494..fde8001 100644
+--- a/libs/core/CMakeLists.txt
++++ b/libs/core/CMakeLists.txt
+@@ -216,6 +216,7 @@ set(lang_public_headers
+ set(lang_query_public_headers
+     include/sen/core/lang/query/bus_lookup.h
+     include/sen/core/lang/query/complete.h
++    include/sen/core/lang/query/guide.h
+     include/sen/core/lang/query/tokenize.h
+     include/sen/core/lang/query/validate.h
+ )
+@@ -232,6 +233,9 @@ set(lang_sources
+     src/lang/fom_document_set.h
+     src/lang/fom_parser.cpp
+     src/lang/query/complete.cpp
++    src/lang/query/fsm.cpp
++    src/lang/query/fsm.h
++    src/lang/query/guide.cpp
+     src/lang/query/tokenize.cpp
+     src/lang/query/validate.cpp
+ )
+diff --git a/libs/core/include/sen/core/lang/query/guide.h b/libs/core/include/sen/core/lang/query/guide.h
+new file mode 100644
+index 0000000..3134ad9
+--- /dev/null
++++ b/libs/core/include/sen/core/lang/query/guide.h
+@@ -0,0 +1,69 @@
++// === guide.h =========================================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#ifndef SEN_CORE_LANG_QUERY_GUIDE_H
++#define SEN_CORE_LANG_QUERY_GUIDE_H
++
++// std
++#include <cstddef>
++#include <string_view>
++
++namespace sen::lang::query
++{
++
++/// \addtogroup lang
++/// @{
++
++/// Grammatical role of whatever the cursor is about to produce. Editors can pick an icon
++/// or styling off this; `hint` carries a default human-readable description for UIs that
++/// don't want to maintain their own message table.
++enum class GuidanceShape
++{
++  selectKeyword,           /// start of query; `SELECT` is expected
++  className,               /// after `SELECT` or a `.` in the class path
++  classPathContinuation,   /// after a class identifier; `FROM`
++  fromKeyword,             /// after `SELECT *`; `FROM`
++  sessionName,             /// after `FROM`
++  busSeparator,            /// after `<session>`; `.`
++  busName,                 /// after `<session>.`
++  whereOrEnd,              /// after the bus; `WHERE` or end of query
++  expression,              /// start of a WHERE expression
++  binaryOperator,          /// after a value; comparison / `AND` / `OR` / `BETWEEN` / `IN` / `NOT`
++  value,                   /// after a comparison operator
++  notContinuation,         /// after `NOT` in binary-op position; `BETWEEN` / `IN` / an expression
++  betweenLowerBound,       /// after `BETWEEN`
++  betweenAnd,              /// after `BETWEEN <value>`; structural `AND`
++  betweenUpperBound,       /// after `BETWEEN <value> AND`
++  inOpenParen,             /// after `IN` / `NOT IN`; `(`
++  inListValue,             /// inside `IN (...)`; a value
++  inListSeparatorOrClose,  /// after a value in `IN (...)`; `,` or `)`
++  none,                    /// nothing useful to hint
++};
++
++/// Guidance for what the cursor should produce next. `hint` is a default static message
++/// keyed off `shape`; callers wanting localization or custom phrasing can ignore it and
++/// derive their own from `shape`.
++struct Guidance
++{
++  GuidanceShape    shape = GuidanceShape::none;
++  std::string_view hint = {};
++};
++
++/// Classify the cursor position in `text` and return a single-shot grammar hint.
++///
++/// `cursor` is a byte offset in [0, text.size()]. Values past the end are clamped. The
++/// function tokenizes tolerantly and walks the same positional FSM as `complete()`, but
++/// consults neither a type registry nor a bus lookup; guidance is pure grammar. For
++/// richer class-aware hints (e.g. "property of Aircraft") consumers should pair this
++/// with `complete()` or render the shape differently.
++[[nodiscard]] Guidance guideAt(std::string_view text, std::size_t cursor) noexcept;
++
++/// @}
++
++}  // namespace sen::lang::query
++
++#endif  // SEN_CORE_LANG_QUERY_GUIDE_H
+diff --git a/libs/core/src/lang/query/complete.cpp b/libs/core/src/lang/query/complete.cpp
+index cd5ddd1..8834620 100644
+--- a/libs/core/src/lang/query/complete.cpp
++++ b/libs/core/src/lang/query/complete.cpp
+@@ -8,7 +8,7 @@
+ #include "sen/core/lang/query/complete.h"
+ 
+ // sen
+-#include "sen/core/lang/stl_scanner.h"
++#include "fsm.h"
+ #include "sen/core/lang/stl_token.h"
+ #include "sen/core/meta/alias_type.h"
+ #include "sen/core/meta/class_type.h"
+@@ -18,7 +18,6 @@
+ #include "sen/core/meta/type_registry.h"
+ 
+ // std
+-#include <algorithm>
+ #include <cstddef>
+ #include <string>
+ #include <utility>
+@@ -30,389 +29,13 @@ namespace sen::lang::query
+ namespace
+ {
+ 
+-/// Re-scan of the source with byte-accurate spans. Shares its span-reconstruction logic
+-/// with `tokenize.cpp` but keeps the raw `StlTokenType` so the FSM can distinguish
+-/// `keywordSelect` from `keywordFrom` without re-parsing lexemes. Comments and EOF are
+-/// dropped here; the FSM never needs them.
+-struct FsmToken
+-{
+-  StlTokenType type = StlTokenType::endOfFile;
+-  TextSpan     span = {};
+-  std::string  lexeme = {};
+-};
+-
+-[[nodiscard]] bool isWhitespace(char c) noexcept { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
+-
+-[[nodiscard]] std::vector<FsmToken> scan(std::string_view text)
+-{
+-  const std::string source(text);
+-  StlScanner        scanner(source, ScanMode::tolerant);
+-  const auto&       raw = scanner.scanTokens();
+-
+-  std::vector<FsmToken> out;
+-  out.reserve(raw.size());
+-
+-  std::size_t cursor = 0U;
+-  for (const auto& t: raw)
+-  {
+-    while (cursor < source.size() && isWhitespace(source[cursor]))
+-    {
+-      ++cursor;
+-    }
+-    std::size_t       end = t.loc.offset;
+-    const std::size_t rawBegin = (cursor <= end) ? cursor : end;
+-
+-    if (t.type == StlTokenType::comment || t.type == StlTokenType::endOfFile)
+-    {
+-      cursor = end;
+-      continue;
+-    }
+-
+-    // The scanner's `number()` consumes trailing whitespace (legacy support for
+-    // `- 5` signed numerics). Trim it off so the reconstructed span ends at the
+-    // last actual token character.
+-    while (end > rawBegin && isWhitespace(source[end - 1U]))
+-    {
+-      --end;
+-    }
+-
+-    FsmToken f;
+-    f.type = t.type;
+-    f.span = TextSpan {rawBegin, end};
+-    f.lexeme = (end > rawBegin) ? source.substr(rawBegin, end - rawBegin) : std::string {};
+-    out.push_back(std::move(f));
+-    cursor = t.loc.offset;
+-  }
+-  return out;
+-}
+-
+-/// Tokens that are "word-like" — the cursor sitting inside or immediately after one of
+-/// these is editing that word.
+-[[nodiscard]] bool isEditableToken(StlTokenType t) noexcept
+-{
+-  switch (t)
+-  {
+-    case StlTokenType::identifier:
+-    case StlTokenType::string:
+-    case StlTokenType::partialString:
+-    case StlTokenType::real:
+-    case StlTokenType::integral:
+-    case StlTokenType::invalidChar:
+-      return true;
+-    default:
+-      break;
+-  }
+-  // All keyword* token types are editable (user may be mid-typing a keyword).
+-  if (t >= StlTokenType::keywordAbstract && t <= StlTokenType::keywordBetween)
+-  {
+-    return true;
+-  }
+-  return false;
+-}
+-
+-/// Locate the token being edited, if any. Returns an index into `tokens` or `tokens.size()`
+-/// when the cursor is between tokens (user is starting a new word).
+-[[nodiscard]] std::size_t findCurrentToken(const std::vector<FsmToken>& tokens, std::size_t cursor) noexcept
+-{
+-  for (std::size_t i = 0U; i < tokens.size(); ++i)
+-  {
+-    const auto& t = tokens[i];
+-    if (cursor > t.span.begin && cursor <= t.span.end && isEditableToken(t.type))
+-    {
+-      return i;
+-    }
+-  }
+-  return tokens.size();
+-}
+-
+-/// Grammar slots the cursor can be in. Each slot drives which completion kinds we emit.
+-enum class Slot
+-{
+-  selectKeyword,      /// start of query; want `SELECT`
+-  classPath,          /// after `SELECT` or a `.` in the class path
+-  classPathTail,      /// after a class-name identifier; want `.` or `FROM`
+-  fromKeyword,        /// after `SELECT *`; want `FROM`
+-  sessionName,        /// after `FROM`
+-  busDot,             /// after `<session>`; want `.`
+-  busName,            /// after `<session>.`
+-  whereOrEnd,         /// after `<session>.<bus>`; want `WHERE` or end
+-  whereExpr,          /// start of an expression (fresh, after AND/OR, after `(`, after NOT)
+-  binaryOp,           /// after a "value" in an expression
+-  literal,            /// after a comparison op; want a value (typed if we know the LHS)
+-  afterNotInExpr,     /// saw `NOT` in binaryOp slot; expect `BETWEEN` / `IN` / expression
+-  betweenFirst,       /// after `BETWEEN`; want the min value
+-  betweenAnd,         /// after `BETWEEN <lit>`; want structural `AND`
+-  betweenSecond,      /// after `BETWEEN <lit> AND`; want the max value
+-  inOpenParen,        /// after `IN` / `NOT IN`; want `(`
+-  inListElem,         /// inside `IN (...)`; want a value
+-  inListSepOrClose,   /// after a value in `IN (...)`; want `,` or `)`
+-  done,               /// no useful suggestions
+-};
+-
+-/// Decide whether a token behaves as a "value" in an expression (an operand). Strings,
+-/// numbers, booleans, identifiers — parenthesized groups close into this too via `)`.
+-[[nodiscard]] bool isValueStart(StlTokenType t) noexcept
+-{
+-  switch (t)
+-  {
+-    case StlTokenType::identifier:
+-    case StlTokenType::string:
+-    case StlTokenType::partialString:
+-    case StlTokenType::integral:
+-    case StlTokenType::real:
+-    case StlTokenType::keywordTrue:
+-    case StlTokenType::keywordFalse:
+-      return true;
+-    default:
+-      return false;
+-  }
+-}
+-
+-/// Pair of (slot, lhsProperty). The property is set while transitioning from binaryOp
+-/// into literal / betweenFirst / inListElem when we can tie the LHS to a known class
+-/// property — so typed-value completion has something to consult.
+-struct FsmState
+-{
+-  Slot                              slot = Slot::selectKeyword;
+-  std::shared_ptr<const Property>   lhsProperty = nullptr;
+-  std::string                       lastIdentifier = {};  /// raw lexeme of the last value identifier
+-  std::string                       sessionName = {};     /// captured between FROM and the session dot
+-};
+-
+-/// Walk tokens and advance the FSM. Returns the state "waiting at" the end of the walk —
+-/// that's what the cursor is pointed at.
+-void step(FsmState& s, const FsmToken& t, const ClassType* cls)
+-{
+-  const auto type = t.type;
+-  switch (s.slot)
+-  {
+-    case Slot::selectKeyword:
+-      if (type == StlTokenType::keywordSelect)
+-      {
+-        s.slot = Slot::classPath;
+-      }
+-      break;
+-
+-    case Slot::classPath:
+-      if (type == StlTokenType::star)
+-      {
+-        s.slot = Slot::fromKeyword;
+-      }
+-      else if (type == StlTokenType::identifier)
+-      {
+-        s.slot = Slot::classPathTail;
+-      }
+-      break;
+-
+-    case Slot::classPathTail:
+-      if (type == StlTokenType::dot)
+-      {
+-        s.slot = Slot::classPath;
+-      }
+-      else if (type == StlTokenType::keywordFrom)
+-      {
+-        s.slot = Slot::sessionName;
+-      }
+-      break;
+-
+-    case Slot::fromKeyword:
+-      if (type == StlTokenType::keywordFrom)
+-      {
+-        s.slot = Slot::sessionName;
+-      }
+-      break;
+-
+-    case Slot::sessionName:
+-      if (type == StlTokenType::identifier)
+-      {
+-        s.sessionName = t.lexeme;
+-        s.slot = Slot::busDot;
+-      }
+-      break;
+-
+-    case Slot::busDot:
+-      if (type == StlTokenType::dot)
+-      {
+-        s.slot = Slot::busName;
+-      }
+-      break;
+-
+-    case Slot::busName:
+-      if (type == StlTokenType::identifier)
+-      {
+-        s.slot = Slot::whereOrEnd;
+-      }
+-      break;
+-
+-    case Slot::whereOrEnd:
+-      if (type == StlTokenType::keywordWhere)
+-      {
+-        s.slot = Slot::whereExpr;
+-      }
+-      break;
+-
+-    case Slot::whereExpr:
+-      if (type == StlTokenType::keywordNot || type == StlTokenType::bang || type == StlTokenType::minus ||
+-          type == StlTokenType::plus)
+-      {
+-        // unary prefix; stay in whereExpr
+-      }
+-      else if (type == StlTokenType::leftParen)
+-      {
+-        // enter a parenthesized sub-expression; stay in whereExpr
+-      }
+-      else if (type == StlTokenType::rightParen)
+-      {
+-        s.slot = Slot::binaryOp;
+-      }
+-      else if (isValueStart(type))
+-      {
+-        if (type == StlTokenType::identifier && cls != nullptr)
+-        {
+-          const Property* p = cls->searchPropertyByName(t.lexeme);
+-          if (p != nullptr)
+-          {
+-            // searchPropertyByName returns a raw pointer; getProperties returns shared_ptrs.
+-            // Look up the shared_ptr to carry meta handle through to typed-value completion.
+-            const auto all = cls->getProperties(ClassType::SearchMode::includeParents);
+-            for (const auto& sp: all)
+-            {
+-              if (sp.get() == p)
+-              {
+-                s.lhsProperty = sp;
+-                break;
+-              }
+-            }
+-          }
+-          else
+-          {
+-            s.lhsProperty.reset();
+-          }
+-          s.lastIdentifier = t.lexeme;
+-        }
+-        else
+-        {
+-          s.lhsProperty.reset();
+-          s.lastIdentifier = {};
+-        }
+-        s.slot = Slot::binaryOp;
+-      }
+-      break;
+-
+-    case Slot::binaryOp:
+-      if (type == StlTokenType::keywordAnd || type == StlTokenType::keywordOr)
+-      {
+-        s.lhsProperty.reset();
+-        s.lastIdentifier = {};
+-        s.slot = Slot::whereExpr;
+-      }
+-      else if (type == StlTokenType::keywordBetween)
+-      {
+-        s.slot = Slot::betweenFirst;
+-      }
+-      else if (type == StlTokenType::keywordIn)
+-      {
+-        s.slot = Slot::inOpenParen;
+-      }
+-      else if (type == StlTokenType::keywordNot)
+-      {
+-        s.slot = Slot::afterNotInExpr;
+-      }
+-      else if (type == StlTokenType::equal || type == StlTokenType::equalEqual || type == StlTokenType::bangEqual ||
+-               type == StlTokenType::less || type == StlTokenType::lessEqual || type == StlTokenType::greater ||
+-               type == StlTokenType::greaterEqual)
+-      {
+-        s.slot = Slot::literal;
+-      }
+-      else if (type == StlTokenType::plus || type == StlTokenType::minus || type == StlTokenType::star ||
+-               type == StlTokenType::slash)
+-      {
+-        s.lhsProperty.reset();
+-        s.lastIdentifier = {};
+-        s.slot = Slot::whereExpr;
+-      }
+-      else if (type == StlTokenType::rightParen)
+-      {
+-        // still a value-ish position, stay
+-      }
+-      break;
+-
+-    case Slot::literal:
+-      if (isValueStart(type))
+-      {
+-        s.slot = Slot::binaryOp;
+-      }
+-      else if (type == StlTokenType::minus || type == StlTokenType::plus)
+-      {
+-        // unary sign on numeric literal; stay
+-      }
+-      break;
+-
+-    case Slot::afterNotInExpr:
+-      if (type == StlTokenType::keywordBetween)
+-      {
+-        s.slot = Slot::betweenFirst;
+-      }
+-      else if (type == StlTokenType::keywordIn)
+-      {
+-        s.slot = Slot::inOpenParen;
+-      }
+-      else
+-      {
+-        s.slot = Slot::done;
+-      }
+-      break;
+-
+-    case Slot::betweenFirst:
+-      if (isValueStart(type))
+-      {
+-        s.slot = Slot::betweenAnd;
+-      }
+-      break;
+-
+-    case Slot::betweenAnd:
+-      if (type == StlTokenType::keywordAnd)
+-      {
+-        s.slot = Slot::betweenSecond;
+-      }
+-      break;
+-
+-    case Slot::betweenSecond:
+-      if (isValueStart(type))
+-      {
+-        s.slot = Slot::binaryOp;
+-      }
+-      break;
+-
+-    case Slot::inOpenParen:
+-      if (type == StlTokenType::leftParen)
+-      {
+-        s.slot = Slot::inListElem;
+-      }
+-      break;
+-
+-    case Slot::inListElem:
+-      if (isValueStart(type))
+-      {
+-        s.slot = Slot::inListSepOrClose;
+-      }
+-      break;
+-
+-    case Slot::inListSepOrClose:
+-      if (type == StlTokenType::comma)
+-      {
+-        s.slot = Slot::inListElem;
+-      }
+-      else if (type == StlTokenType::rightParen)
+-      {
+-        s.slot = Slot::binaryOp;
+-      }
+-      break;
+-
+-    case Slot::done:
+-      break;
+-  }
+-}
++using detail::countCommittedTokens;
++using detail::findCurrentToken;
++using detail::FsmState;
++using detail::FsmToken;
++using detail::scan;
++using detail::Slot;
++using detail::step;
+ 
+ /// Resolve the `SELECT`ed class by scanning until `FROM` (or end). Returns null when the
+ /// class name is absent, multi-segment with unresolved parts, or not in the registry.
+@@ -650,7 +273,8 @@ CompleteResult complete(std::string_view          text,
+   // lists off it.
+   const ClassType* cls = resolveSelectedClass(tokens, types);
+   FsmState         state;
+-  const std::size_t stopAt = (currentIdx < tokens.size()) ? currentIdx : tokens.size();
++  const std::size_t stopAt =
++    (currentIdx < tokens.size()) ? currentIdx : countCommittedTokens(tokens, cursor);
+   for (std::size_t i = 0U; i < stopAt; ++i)
+   {
+     step(state, tokens[i], cls);
+diff --git a/libs/core/src/lang/query/fsm.cpp b/libs/core/src/lang/query/fsm.cpp
+new file mode 100644
+index 0000000..e2d8635
+--- /dev/null
++++ b/libs/core/src/lang/query/fsm.cpp
+@@ -0,0 +1,376 @@
++// === fsm.cpp =========================================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#include "fsm.h"
++
++// sen
++#include "sen/core/lang/stl_scanner.h"
++
++// std
++#include <string>
++#include <utility>
++
++namespace sen::lang::query::detail
++{
++
++namespace
++{
++
++[[nodiscard]] bool isWhitespace(char c) noexcept { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
++
++/// Tokens that are "word-like": the cursor sitting inside or immediately after one of
++/// these is editing that word.
++[[nodiscard]] bool isEditableToken(StlTokenType t) noexcept
++{
++  switch (t)
++  {
++    case StlTokenType::identifier:
++    case StlTokenType::string:
++    case StlTokenType::partialString:
++    case StlTokenType::real:
++    case StlTokenType::integral:
++    case StlTokenType::invalidChar:
++      return true;
++    default:
++      break;
++  }
++  // All keyword* token types are editable (user may be mid-typing a keyword).
++  if (t >= StlTokenType::keywordAbstract && t <= StlTokenType::keywordBetween)
++  {
++    return true;
++  }
++  return false;
++}
++
++/// Decide whether a token behaves as a "value" in an expression (an operand). Strings,
++/// numbers, booleans, identifiers; parenthesized groups close into this too via `)`.
++[[nodiscard]] bool isValueStart(StlTokenType t) noexcept
++{
++  switch (t)
++  {
++    case StlTokenType::identifier:
++    case StlTokenType::string:
++    case StlTokenType::partialString:
++    case StlTokenType::integral:
++    case StlTokenType::real:
++    case StlTokenType::keywordTrue:
++    case StlTokenType::keywordFalse:
++      return true;
++    default:
++      return false;
++  }
++}
++
++}  // namespace
++
++std::vector<FsmToken> scan(std::string_view text)
++{
++  const std::string source(text);
++  StlScanner        scanner(source, ScanMode::tolerant);
++  const auto&       raw = scanner.scanTokens();
++
++  std::vector<FsmToken> out;
++  out.reserve(raw.size());
++
++  std::size_t cursor = 0U;
++  for (const auto& t: raw)
++  {
++    while (cursor < source.size() && isWhitespace(source[cursor]))
++    {
++      ++cursor;
++    }
++    std::size_t       end = t.loc.offset;
++    const std::size_t rawBegin = (cursor <= end) ? cursor : end;
++
++    if (t.type == StlTokenType::comment || t.type == StlTokenType::endOfFile)
++    {
++      cursor = end;
++      continue;
++    }
++
++    // The scanner's `number()` consumes trailing whitespace (legacy support for
++    // `- 5` signed numerics). Trim it off so the reconstructed span ends at the
++    // last actual token character.
++    while (end > rawBegin && isWhitespace(source[end - 1U]))
++    {
++      --end;
++    }
++
++    FsmToken f;
++    f.type = t.type;
++    f.span = TextSpan {rawBegin, end};
++    f.lexeme = (end > rawBegin) ? source.substr(rawBegin, end - rawBegin) : std::string {};
++    out.push_back(std::move(f));
++    cursor = t.loc.offset;
++  }
++  return out;
++}
++
++std::size_t findCurrentToken(const std::vector<FsmToken>& tokens, std::size_t cursor) noexcept
++{
++  for (std::size_t i = 0U; i < tokens.size(); ++i)
++  {
++    const auto& t = tokens[i];
++    if (cursor > t.span.begin && cursor <= t.span.end && isEditableToken(t.type))
++    {
++      return i;
++    }
++  }
++  return tokens.size();
++}
++
++std::size_t countCommittedTokens(const std::vector<FsmToken>& tokens, std::size_t cursor) noexcept
++{
++  std::size_t n = 0U;
++  for (const auto& t: tokens)
++  {
++    if (t.span.end <= cursor)
++    {
++      ++n;
++    }
++    else
++    {
++      break;
++    }
++  }
++  return n;
++}
++
++void step(FsmState& s, const FsmToken& t, const ClassType* cls)
++{
++  const auto type = t.type;
++  switch (s.slot)
++  {
++    case Slot::selectKeyword:
++      if (type == StlTokenType::keywordSelect)
++      {
++        s.slot = Slot::classPath;
++      }
++      break;
++
++    case Slot::classPath:
++      if (type == StlTokenType::star)
++      {
++        s.slot = Slot::fromKeyword;
++      }
++      else if (type == StlTokenType::identifier)
++      {
++        s.slot = Slot::classPathTail;
++      }
++      break;
++
++    case Slot::classPathTail:
++      if (type == StlTokenType::dot)
++      {
++        s.slot = Slot::classPath;
++      }
++      else if (type == StlTokenType::keywordFrom)
++      {
++        s.slot = Slot::sessionName;
++      }
++      break;
++
++    case Slot::fromKeyword:
++      if (type == StlTokenType::keywordFrom)
++      {
++        s.slot = Slot::sessionName;
++      }
++      break;
++
++    case Slot::sessionName:
++      if (type == StlTokenType::identifier)
++      {
++        s.sessionName = t.lexeme;
++        s.slot = Slot::busDot;
++      }
++      break;
++
++    case Slot::busDot:
++      if (type == StlTokenType::dot)
++      {
++        s.slot = Slot::busName;
++      }
++      break;
++
++    case Slot::busName:
++      if (type == StlTokenType::identifier)
++      {
++        s.slot = Slot::whereOrEnd;
++      }
++      break;
++
++    case Slot::whereOrEnd:
++      if (type == StlTokenType::keywordWhere)
++      {
++        s.slot = Slot::whereExpr;
++      }
++      break;
++
++    case Slot::whereExpr:
++      if (type == StlTokenType::keywordNot || type == StlTokenType::bang || type == StlTokenType::minus ||
++          type == StlTokenType::plus)
++      {
++        // unary prefix; stay in whereExpr
++      }
++      else if (type == StlTokenType::leftParen)
++      {
++        // enter a parenthesized sub-expression; stay in whereExpr
++      }
++      else if (type == StlTokenType::rightParen)
++      {
++        s.slot = Slot::binaryOp;
++      }
++      else if (isValueStart(type))
++      {
++        if (type == StlTokenType::identifier && cls != nullptr)
++        {
++          const Property* p = cls->searchPropertyByName(t.lexeme);
++          if (p != nullptr)
++          {
++            // searchPropertyByName returns a raw pointer; getProperties returns shared_ptrs.
++            // Look up the shared_ptr to carry meta handle through to typed-value completion.
++            const auto all = cls->getProperties(ClassType::SearchMode::includeParents);
++            for (const auto& sp: all)
++            {
++              if (sp.get() == p)
++              {
++                s.lhsProperty = sp;
++                break;
++              }
++            }
++          }
++          else
++          {
++            s.lhsProperty.reset();
++          }
++          s.lastIdentifier = t.lexeme;
++        }
++        else
++        {
++          s.lhsProperty.reset();
++          s.lastIdentifier = {};
++        }
++        s.slot = Slot::binaryOp;
++      }
++      break;
++
++    case Slot::binaryOp:
++      if (type == StlTokenType::keywordAnd || type == StlTokenType::keywordOr)
++      {
++        s.lhsProperty.reset();
++        s.lastIdentifier = {};
++        s.slot = Slot::whereExpr;
++      }
++      else if (type == StlTokenType::keywordBetween)
++      {
++        s.slot = Slot::betweenFirst;
++      }
++      else if (type == StlTokenType::keywordIn)
++      {
++        s.slot = Slot::inOpenParen;
++      }
++      else if (type == StlTokenType::keywordNot)
++      {
++        s.slot = Slot::afterNotInExpr;
++      }
++      else if (type == StlTokenType::equal || type == StlTokenType::equalEqual || type == StlTokenType::bangEqual ||
++               type == StlTokenType::less || type == StlTokenType::lessEqual || type == StlTokenType::greater ||
++               type == StlTokenType::greaterEqual)
++      {
++        s.slot = Slot::literal;
++      }
++      else if (type == StlTokenType::plus || type == StlTokenType::minus || type == StlTokenType::star ||
++               type == StlTokenType::slash)
++      {
++        s.lhsProperty.reset();
++        s.lastIdentifier = {};
++        s.slot = Slot::whereExpr;
++      }
++      else if (type == StlTokenType::rightParen)
++      {
++        // still a value-ish position, stay
++      }
++      break;
++
++    case Slot::literal:
++      if (isValueStart(type))
++      {
++        s.slot = Slot::binaryOp;
++      }
++      else if (type == StlTokenType::minus || type == StlTokenType::plus)
++      {
++        // unary sign on numeric literal; stay
++      }
++      break;
++
++    case Slot::afterNotInExpr:
++      if (type == StlTokenType::keywordBetween)
++      {
++        s.slot = Slot::betweenFirst;
++      }
++      else if (type == StlTokenType::keywordIn)
++      {
++        s.slot = Slot::inOpenParen;
++      }
++      else
++      {
++        s.slot = Slot::done;
++      }
++      break;
++
++    case Slot::betweenFirst:
++      if (isValueStart(type))
++      {
++        s.slot = Slot::betweenAnd;
++      }
++      break;
++
++    case Slot::betweenAnd:
++      if (type == StlTokenType::keywordAnd)
++      {
++        s.slot = Slot::betweenSecond;
++      }
++      break;
++
++    case Slot::betweenSecond:
++      if (isValueStart(type))
++      {
++        s.slot = Slot::binaryOp;
++      }
++      break;
++
++    case Slot::inOpenParen:
++      if (type == StlTokenType::leftParen)
++      {
++        s.slot = Slot::inListElem;
++      }
++      break;
++
++    case Slot::inListElem:
++      if (isValueStart(type))
++      {
++        s.slot = Slot::inListSepOrClose;
++      }
++      break;
++
++    case Slot::inListSepOrClose:
++      if (type == StlTokenType::comma)
++      {
++        s.slot = Slot::inListElem;
++      }
++      else if (type == StlTokenType::rightParen)
++      {
++        s.slot = Slot::binaryOp;
++      }
++      break;
++
++    case Slot::done:
++      break;
++  }
++}
++
++}  // namespace sen::lang::query::detail
+diff --git a/libs/core/src/lang/query/fsm.h b/libs/core/src/lang/query/fsm.h
+new file mode 100644
+index 0000000..7565287
+--- /dev/null
++++ b/libs/core/src/lang/query/fsm.h
+@@ -0,0 +1,93 @@
++// === fsm.h ===========================================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#ifndef SEN_CORE_LANG_QUERY_FSM_H
++#define SEN_CORE_LANG_QUERY_FSM_H
++
++// sen
++#include "sen/core/lang/code_location.h"
++#include "sen/core/lang/stl_token.h"
++#include "sen/core/meta/class_type.h"
++#include "sen/core/meta/property.h"
++
++// std
++#include <cstddef>
++#include <memory>
++#include <string>
++#include <string_view>
++#include <vector>
++
++/// Internal positional-FSM shared by `complete()` and `guideAt()`. Neither the types nor
++/// the functions in this header are part of the public API.
++
++namespace sen::lang::query::detail
++{
++
++/// Re-scan of the source with byte-accurate spans. Keeps the raw `StlTokenType` so the FSM
++/// can distinguish `keywordSelect` from `keywordFrom` without re-parsing lexemes. Comments
++/// and EOF are dropped here; the FSM never needs them.
++struct FsmToken
++{
++  StlTokenType type = StlTokenType::endOfFile;
++  TextSpan     span = {};
++  std::string  lexeme = {};
++};
++
++[[nodiscard]] std::vector<FsmToken> scan(std::string_view text);
++
++/// Locate the token being edited, if any. Returns an index into `tokens` or `tokens.size()`
++/// when the cursor is between tokens (user is starting a new word).
++[[nodiscard]] std::size_t findCurrentToken(const std::vector<FsmToken>& tokens, std::size_t cursor) noexcept;
++
++/// Count tokens whose span ends at or before `cursor`: tokens the cursor has already
++/// passed and that should be replayed through the FSM. Used to pick the walk length
++/// when no token is being edited. Assumes `tokens` is in source order.
++[[nodiscard]] std::size_t countCommittedTokens(const std::vector<FsmToken>& tokens, std::size_t cursor) noexcept;
++
++/// Grammar slots the cursor can be in. Each slot drives which completion kinds and
++/// guidance shapes we emit.
++enum class Slot
++{
++  selectKeyword,     /// start of query; want `SELECT`
++  classPath,         /// after `SELECT` or a `.` in the class path
++  classPathTail,     /// after a class-name identifier; want `.` or `FROM`
++  fromKeyword,       /// after `SELECT *`; want `FROM`
++  sessionName,       /// after `FROM`
++  busDot,            /// after `<session>`; want `.`
++  busName,           /// after `<session>.`
++  whereOrEnd,        /// after `<session>.<bus>`; want `WHERE` or end
++  whereExpr,         /// start of an expression (fresh, after AND/OR, after `(`, after NOT)
++  binaryOp,          /// after a "value" in an expression
++  literal,           /// after a comparison op; want a value (typed if we know the LHS)
++  afterNotInExpr,    /// saw `NOT` in binaryOp slot; expect `BETWEEN` / `IN` / expression
++  betweenFirst,      /// after `BETWEEN`; want the min value
++  betweenAnd,        /// after `BETWEEN <lit>`; want structural `AND`
++  betweenSecond,     /// after `BETWEEN <lit> AND`; want the max value
++  inOpenParen,       /// after `IN` / `NOT IN`; want `(`
++  inListElem,        /// inside `IN (...)`; want a value
++  inListSepOrClose,  /// after a value in `IN (...)`; want `,` or `)`
++  done,              /// no useful suggestions
++};
++
++/// Pair of (slot, lhsProperty). The property is set while transitioning from binaryOp
++/// into literal / betweenFirst / inListElem when we can tie the LHS to a known class
++/// property, so typed-value completion has something to consult.
++struct FsmState
++{
++  Slot                            slot = Slot::selectKeyword;
++  std::shared_ptr<const Property> lhsProperty = nullptr;
++  std::string                     lastIdentifier = {};
++  std::string                     sessionName = {};
++};
++
++/// Advance the FSM by one token. `cls` may be null; when null the class-aware property
++/// binding is skipped (useful for guidance, which doesn't care about LHS identity).
++void step(FsmState& s, const FsmToken& t, const ClassType* cls);
++
++}  // namespace sen::lang::query::detail
++
++#endif  // SEN_CORE_LANG_QUERY_FSM_H
+diff --git a/libs/core/src/lang/query/guide.cpp b/libs/core/src/lang/query/guide.cpp
+new file mode 100644
+index 0000000..bb5ef7f
+--- /dev/null
++++ b/libs/core/src/lang/query/guide.cpp
+@@ -0,0 +1,112 @@
++// === guide.cpp =======================================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#include "sen/core/lang/query/guide.h"
++
++// sen
++#include "fsm.h"
++
++// std
++#include <cstddef>
++
++namespace sen::lang::query
++{
++
++namespace
++{
++
++using detail::countCommittedTokens;
++using detail::findCurrentToken;
++using detail::FsmState;
++using detail::scan;
++using detail::Slot;
++using detail::step;
++
++struct ShapeHint
++{
++  GuidanceShape    shape;
++  std::string_view hint;
++};
++
++[[nodiscard]] ShapeHint shapeForSlot(Slot slot) noexcept
++{
++  // Hints are shown inline as ghost text while the user is mid-query. They read as a label
++  // of what comes next ("`SELECT`", "a class name"), never as a complaint: the user has
++  // not "failed" to type anything yet.
++  switch (slot)
++  {
++    case Slot::selectKeyword:
++      return {GuidanceShape::selectKeyword, "`SELECT`"};
++    case Slot::classPath:
++      return {GuidanceShape::className, "a class name"};
++    case Slot::classPathTail:
++      return {GuidanceShape::classPathContinuation, "`FROM`"};
++    case Slot::fromKeyword:
++      return {GuidanceShape::fromKeyword, "`FROM`"};
++    case Slot::sessionName:
++      return {GuidanceShape::sessionName, "a session name"};
++    case Slot::busDot:
++      return {GuidanceShape::busSeparator, "`.`"};
++    case Slot::busName:
++      return {GuidanceShape::busName, "a bus name"};
++    case Slot::whereOrEnd:
++      return {GuidanceShape::whereOrEnd, "`WHERE` or end of query"};
++    case Slot::whereExpr:
++      return {GuidanceShape::expression, "a property, value, or sub-expression"};
++    case Slot::binaryOp:
++      return {GuidanceShape::binaryOperator,
++              "a comparison operator, `AND`, `OR`, `BETWEEN`, `IN`, or `NOT`"};
++    case Slot::literal:
++      return {GuidanceShape::value, "a value"};
++    case Slot::afterNotInExpr:
++      return {GuidanceShape::notContinuation, "`BETWEEN`, `IN`, or an expression"};
++    case Slot::betweenFirst:
++      return {GuidanceShape::betweenLowerBound, "a lower bound"};
++    case Slot::betweenAnd:
++      return {GuidanceShape::betweenAnd, "`AND`"};
++    case Slot::betweenSecond:
++      return {GuidanceShape::betweenUpperBound, "an upper bound"};
++    case Slot::inOpenParen:
++      return {GuidanceShape::inOpenParen, "`(`"};
++    case Slot::inListElem:
++      return {GuidanceShape::inListValue, "a value"};
++    case Slot::inListSepOrClose:
++      return {GuidanceShape::inListSeparatorOrClose, "`,` or `)`"};
++    case Slot::done:
++      return {GuidanceShape::none, {}};
++  }
++  return {GuidanceShape::none, {}};
++}
++
++}  // namespace
++
++Guidance guideAt(std::string_view text, std::size_t cursor) noexcept
++{
++  if (cursor > text.size())
++  {
++    cursor = text.size();
++  }
++
++  const auto tokens = scan(text);
++  const auto currentIdx = findCurrentToken(tokens, cursor);
++
++  // Walk tokens strictly before the current token (or the tokens the cursor has already
++  // passed when it sits between tokens). The slot at the end of the walk is the slot the
++  // cursor points at.
++  FsmState          state;
++  const std::size_t stopAt =
++    (currentIdx < tokens.size()) ? currentIdx : countCommittedTokens(tokens, cursor);
++  for (std::size_t i = 0U; i < stopAt; ++i)
++  {
++    step(state, tokens[i], /*cls=*/nullptr);
++  }
++
++  const auto sh = shapeForSlot(state.slot);
++  return Guidance {sh.shape, sh.hint};
++}
++
++}  // namespace sen::lang::query
+diff --git a/libs/core/test/CMakeLists.txt b/libs/core/test/CMakeLists.txt
+index 7777109..7118b6c 100644
+--- a/libs/core/test/CMakeLists.txt
++++ b/libs/core/test/CMakeLists.txt
+@@ -69,6 +69,7 @@ set(lang_tests
+     lang/query/tokenize_test.cpp
+     lang/query/validate_test.cpp
+     lang/query/complete_test.cpp
++    lang/query/guide_test.cpp
+ )
+ 
+ set(obj_tests
+diff --git a/libs/core/test/lang/query/guide_test.cpp b/libs/core/test/lang/query/guide_test.cpp
+new file mode 100644
+index 0000000..5883d17
+--- /dev/null
++++ b/libs/core/test/lang/query/guide_test.cpp
+@@ -0,0 +1,166 @@
++// === guide_test.cpp ==================================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#include "sen/core/lang/query/guide.h"
++
++// gtest
++#include <gtest/gtest.h>
++
++using sen::lang::query::Guidance;
++using sen::lang::query::guideAt;
++using sen::lang::query::GuidanceShape;
++
++namespace
++{
++
++Guidance at(const std::string& text) { return guideAt(text, text.size()); }
++
++Guidance at(const std::string& text, std::size_t cursor) { return guideAt(text, cursor); }
++
++TEST(QueryGuide, emptyInputExpectsSelect)
++{
++  const auto g = at("");
++  EXPECT_EQ(g.shape, GuidanceShape::selectKeyword);
++  EXPECT_FALSE(g.hint.empty());
++}
++
++TEST(QueryGuide, afterSelectExpectsClassName)
++{
++  const auto g = at("SELECT ");
++  EXPECT_EQ(g.shape, GuidanceShape::className);
++}
++
++TEST(QueryGuide, midClassNameStillExpectsClassName)
++{
++  const auto g = at("SELECT Air");
++  EXPECT_EQ(g.shape, GuidanceShape::className);
++}
++
++TEST(QueryGuide, afterClassIdentExpectsFrom)
++{
++  const auto g = at("SELECT Aircraft ");
++  EXPECT_EQ(g.shape, GuidanceShape::classPathContinuation);
++  EXPECT_EQ(g.hint, "`FROM`");
++}
++
++TEST(QueryGuide, afterClassDotExpectsClassName)
++{
++  const auto g = at("SELECT demo.");
++  EXPECT_EQ(g.shape, GuidanceShape::className);
++}
++
++TEST(QueryGuide, afterStarExpectsFrom)
++{
++  const auto g = at("SELECT * ");
++  EXPECT_EQ(g.shape, GuidanceShape::fromKeyword);
++}
++
++TEST(QueryGuide, afterFromExpectsSession)
++{
++  const auto g = at("SELECT Aircraft FROM ");
++  EXPECT_EQ(g.shape, GuidanceShape::sessionName);
++}
++
++TEST(QueryGuide, afterSessionExpectsDot)
++{
++  const auto g = at("SELECT Aircraft FROM sim ");
++  EXPECT_EQ(g.shape, GuidanceShape::busSeparator);
++}
++
++TEST(QueryGuide, afterSessionDotExpectsBus)
++{
++  const auto g = at("SELECT Aircraft FROM sim.");
++  EXPECT_EQ(g.shape, GuidanceShape::busName);
++}
++
++TEST(QueryGuide, afterBusExpectsWhereOrEnd)
++{
++  const auto g = at("SELECT Aircraft FROM sim.env ");
++  EXPECT_EQ(g.shape, GuidanceShape::whereOrEnd);
++}
++
++TEST(QueryGuide, afterWhereExpectsExpression)
++{
++  const auto g = at("SELECT Aircraft FROM sim.env WHERE ");
++  EXPECT_EQ(g.shape, GuidanceShape::expression);
++}
++
++TEST(QueryGuide, afterValueExpectsBinaryOperator)
++{
++  const auto g = at("SELECT Aircraft FROM sim.env WHERE altitude ");
++  EXPECT_EQ(g.shape, GuidanceShape::binaryOperator);
++}
++
++TEST(QueryGuide, afterCompareExpectsValue)
++{
++  const auto g = at("SELECT Aircraft FROM sim.env WHERE altitude > ");
++  EXPECT_EQ(g.shape, GuidanceShape::value);
++}
++
++TEST(QueryGuide, afterNotInBinaryOpExpectsBetweenOrIn)
++{
++  const auto g = at("SELECT Aircraft FROM sim.env WHERE altitude NOT ");
++  EXPECT_EQ(g.shape, GuidanceShape::notContinuation);
++}
++
++TEST(QueryGuide, afterBetweenExpectsLowerBound)
++{
++  const auto g = at("SELECT Aircraft FROM sim.env WHERE altitude BETWEEN ");
++  EXPECT_EQ(g.shape, GuidanceShape::betweenLowerBound);
++}
++
++TEST(QueryGuide, afterBetweenLowerExpectsAnd)
++{
++  const auto g = at("SELECT Aircraft FROM sim.env WHERE altitude BETWEEN 10 ");
++  EXPECT_EQ(g.shape, GuidanceShape::betweenAnd);
++}
++
++TEST(QueryGuide, afterBetweenAndExpectsUpperBound)
++{
++  const auto g = at("SELECT Aircraft FROM sim.env WHERE altitude BETWEEN 10 AND ");
++  EXPECT_EQ(g.shape, GuidanceShape::betweenUpperBound);
++}
++
++TEST(QueryGuide, afterInExpectsOpenParen)
++{
++  const auto g = at("SELECT Aircraft FROM sim.env WHERE force IN ");
++  EXPECT_EQ(g.shape, GuidanceShape::inOpenParen);
++}
++
++TEST(QueryGuide, insideInListExpectsValue)
++{
++  const auto g = at("SELECT Aircraft FROM sim.env WHERE force IN (");
++  EXPECT_EQ(g.shape, GuidanceShape::inListValue);
++}
++
++TEST(QueryGuide, afterInListValueExpectsSeparatorOrClose)
++{
++  const auto g = at("SELECT Aircraft FROM sim.env WHERE force IN (\"friendly\" ");
++  EXPECT_EQ(g.shape, GuidanceShape::inListSeparatorOrClose);
++}
++
++TEST(QueryGuide, cursorClampedBeyondEnd)
++{
++  const std::string text = "SELECT ";
++  const auto        g = at(text, text.size() + 100U);
++  EXPECT_EQ(g.shape, GuidanceShape::className);
++}
++
++TEST(QueryGuide, cursorBeforeSelectReportsSelectKeyword)
++{
++  const auto g = at("SELECT Aircraft FROM sim.env", 0U);
++  EXPECT_EQ(g.shape, GuidanceShape::selectKeyword);
++}
++
++TEST(QueryGuide, hintNonEmptyForNonDoneShapes)
++{
++  const auto g = at("SELECT Aircraft FROM sim.env WHERE altitude > ");
++  EXPECT_EQ(g.shape, GuidanceShape::value);
++  EXPECT_FALSE(g.hint.empty());
++}
++
++}  // namespace
+-- 
+2.51.0
+

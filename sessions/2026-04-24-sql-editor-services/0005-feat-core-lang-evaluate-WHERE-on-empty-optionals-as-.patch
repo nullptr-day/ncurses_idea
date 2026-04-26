@@ -1,0 +1,706 @@
+From 0f03c31f2888351bf26847e053e7a3a3886a6a5f Mon Sep 17 00:00:00 2001
+From: Enrique Parodi Spalazzi <enrique.parodi@airbus.com>
+Date: Fri, 24 Apr 2026 00:18:40 +0200
+Subject: [PATCH 05/10] feat[core/lang]: evaluate WHERE on empty optionals as
+ false
+
+Previously the generated senImplGetFieldValueGetter for an
+optional-typed property fell through to throwRuntimeError, which the
+object filter caught and used to invalidate the query, so any WHERE
+referencing an optional silently never matched.
+
+Now:
+- lang::Value carries std::monostate as the empty marker.
+- VM comparisons short-circuit to false when either side is empty.
+- mathOperation and negate propagate the empty marker.
+- Boolean consumers (AND, OR, jumps) treat empty as false.
+- The object filter coerces a non-bool interpret result to false so
+  a bare WHERE optProp does not crash on std::get<bool>.
+
+Codegen (apps/cli_gen) gains an isOptionalType branch that unwraps via
+has_value() + operator* for native, enum, duration, and quantity inner
+types. Optional of struct or variant still raises a targeted runtime
+error and stays out of scope for now.
+
+Documents the semantics in docs/users_guide/sql.md and exercises them
+with a VM-level compiler test plus an end-to-end ObjectFilter test on a
+newly added optional property in example_class.
+---
+ apps/cli_gen/src/common/json_type_storage.cpp | 13 +++
+ apps/cli_gen/src/cpp/templates/class_decl.j2  | 12 +++
+ docs/users_guide/sql.md                       | 25 +-----
+ libs/core/include/sen/core/lang/vm.h          |  6 +-
+ libs/core/src/lang/vm.cpp                     | 88 +++++++++++++------
+ libs/core/src/obj/object_filter.cpp           |  3 +-
+ libs/core/test/lang/compiler_test.cpp         | 62 +++++++++++++
+ libs/core/test/obj/object_filter_test.cpp     | 86 +++++++++++++-----
+ libs/core/test/obj/stl/example_class.stl      |  3 +
+ 9 files changed, 225 insertions(+), 73 deletions(-)
+
+diff --git a/apps/cli_gen/src/common/json_type_storage.cpp b/apps/cli_gen/src/common/json_type_storage.cpp
+index 6cf768f..cc5536f 100644
+--- a/apps/cli_gen/src/common/json_type_storage.cpp
++++ b/apps/cli_gen/src/common/json_type_storage.cpp
+@@ -440,6 +440,7 @@ void addIsTypeInfo(inja::json& data, const sen::Type* type)
+   data["isDurationType"] = type->isDurationType();
+   data["isQuantityType"] = type->isQuantityType() && !type->isTimestampType();
+   data["isEnum"] = type->isEnumType();
++  data["isOptionalType"] = type->isOptionalType();
+ }
+ 
+ void replaceAll(std::string& str, const std::string& from, const std::string& to)
+@@ -1089,6 +1090,18 @@ inja::json JsonTypeStorage::toJson(std::shared_ptr<const sen::Property> prop) co
+   {
+     auto propType = prop->getType()->isAliasType() ? prop->getType()->asAliasType()->getAliasedType() : prop->getType();
+     addIsTypeInfo(data, propType.type());
++
++    if (propType->isOptionalType())
++    {
++      const auto innerHandle = propType->asOptionalType()->getType();
++      auto [innerAbs, innerRel, innerSenRel] = cppTypeName(*innerHandle);
++      std::ignore = innerRel;
++      std::ignore = innerSenRel;
++      data["optionalInnerQualType"] = innerAbs;
++      inja::json inner;
++      addIsTypeInfo(inner, innerHandle.type());
++      data["optionalInner"] = inner;
++    }
+   }
+ 
+   switch (prop->getCategory())
+diff --git a/apps/cli_gen/src/cpp/templates/class_decl.j2 b/apps/cli_gen/src/cpp/templates/class_decl.j2
+index 8119946..5f76f93 100644
+--- a/apps/cli_gen/src/cpp/templates/class_decl.j2
++++ b/apps/cli_gen/src/cpp/templates/class_decl.j2
+@@ -464,6 +464,18 @@ template <class P>
+       return {[this](){ return {{ prop.getter.name }}().toSeconds(); }, {%if prop.dynamic %}&flags_[{{ propertyIndex }}U]{% else %}nullptr{% endif %}};
+ ## else if prop.isQuantityType
+       return {[this](){ return {{ prop.getter.name }}().get(); }, {%if prop.dynamic %}&flags_[{{ propertyIndex }}U]{% else %}nullptr{% endif %}};
++## else if prop.isOptionalType
++## if prop.optionalInner.isNativeType
++      return {[this]() -> ::sen::lang::Value { const auto& opt = {{ prop.getter.name }}(); if (!opt.has_value()) return std::monostate {}; return *opt; }, {%if prop.dynamic %}&flags_[{{ propertyIndex }}U]{% else %}nullptr{% endif %}};
++## else if prop.optionalInner.isEnum
++      return {[this]() -> ::sen::lang::Value { const auto& opt = {{ prop.getter.name }}(); if (!opt.has_value()) return std::monostate {}; return std::string(::sen::StringConversionTraits<{{ prop.optionalInnerQualType }}>::toString(*opt)); }, {%if prop.dynamic %}&flags_[{{ propertyIndex }}U]{% else %}nullptr{% endif %}};
++## else if prop.optionalInner.isDurationType
++      return {[this]() -> ::sen::lang::Value { const auto& opt = {{ prop.getter.name }}(); if (!opt.has_value()) return std::monostate {}; return opt->toSeconds(); }, {%if prop.dynamic %}&flags_[{{ propertyIndex }}U]{% else %}nullptr{% endif %}};
++## else if prop.optionalInner.isQuantityType
++      return {[this]() -> ::sen::lang::Value { const auto& opt = {{ prop.getter.name }}(); if (!opt.has_value()) return std::monostate {}; return opt->get(); }, {%if prop.dynamic %}&flags_[{{ propertyIndex }}U]{% else %}nullptr{% endif %}};
++## else
++      ::sen::throwRuntimeError("optional of non-scalar type {{ prop.qualType }} is not supported for property {{ prop.name }}");
++## endif
+ ## else
+       ::sen::throwRuntimeError("non native type {{ prop.qualType }} supported for property {{ prop.name }}");
+ ## endif
+diff --git a/docs/users_guide/sql.md b/docs/users_guide/sql.md
+index 2b883c2..8efc6ea 100644
+--- a/docs/users_guide/sql.md
++++ b/docs/users_guide/sql.md
+@@ -270,8 +270,8 @@ An optional property may or may not carry a value. When it does not carry a valu
+ involving it evaluates to `false`. This means `WHERE optionalValue > 5` matches only objects for
+ which the property is present and its value is greater than 5.
+ 
+-There is currently no syntax to ask whether an optional is empty or present. An explicit
+-`IS NULL` / `IS NOT NULL` form is planned; see [Planned extensions](#planned-extensions).
++There is no dedicated syntax for presence checks: the rule above is enough to filter positively on
++presence, and the absence case is not expressible on its own.
+ 
+ ### Range checks (`BETWEEN`)
+ 
+@@ -362,24 +362,3 @@ SELECT se.Aircraft FROM se.env
+  WHERE (altitude > 10000 OR speed > 300)
+    AND NOT isSimulated
+ ```
+-
+-## Planned extensions
+-
+-The following extensions are planned. They are not yet accepted by the parser.
+-
+-### `IS NULL` and `IS NOT NULL`
+-
+-Explicit presence checks for optional properties:
+-
+-```sql
+-WHERE maintenanceWindow IS NULL
+-WHERE operator IS NOT NULL
+-```
+-
+-These forms will be added as a single comparison operator family alongside the existing
+-comparators. They apply to optional properties only; using them on a non-optional property is an
+-error.
+-
+-Until this is implemented, there is no way to react specifically to the absence of a value. You can
+-only filter positively on the presence of a value, since comparisons on empty optionals evaluate to
+-`false` and are excluded from the result.
+diff --git a/libs/core/include/sen/core/lang/vm.h b/libs/core/include/sen/core/lang/vm.h
+index 1c7989f..e33e23c 100644
+--- a/libs/core/include/sen/core/lang/vm.h
++++ b/libs/core/include/sen/core/lang/vm.h
+@@ -61,7 +61,11 @@ struct VariantAccessError
+ };
+ 
+ /// A value that can be in the stack.
+-using Value = std::variant<float32_t,
++///
++/// `std::monostate` is the "empty optional" marker: comparisons involving it evaluate to
++/// `false` and the filter entry point coerces a trailing empty to `false`.
++using Value = std::variant<std::monostate,
++                           float32_t,
+                            float64_t,
+                            int32_t,
+                            uint32_t,
+diff --git a/libs/core/src/lang/vm.cpp b/libs/core/src/lang/vm.cpp
+index 9e77e04..2f832de 100644
+--- a/libs/core/src/lang/vm.cpp
++++ b/libs/core/src/lang/vm.cpp
+@@ -290,6 +290,11 @@ bool compare(const Value& a, const Value& b, C op)  // NOLINT
+     return false;
+   }
+ 
++  if (holds<std::monostate>(a) || holds<std::monostate>(b))
++  {
++    return false;
++  }
++
+   if (holds<std::string>(a))
+   {
+     if (holds<std::string>(b))
+@@ -384,7 +389,7 @@ bool Chunk::isValid() const noexcept { return !code_.empty(); }
+ 
+ void Chunk::disassemble(const std::string& name) const
+ {
+-  printf("== %s ==\n", name.c_str());  // NOLINT
++  printf("== %s ==\n", name.c_str());  // NOLINT(hicpp-vararg)
+ 
+   for (std::size_t offset = 0U; offset < code_.size();)
+   {
+@@ -395,10 +400,10 @@ void Chunk::disassemble(const std::string& name) const
+ std::size_t Chunk::disassembleInstruction(std::size_t offset) const
+ {
+   // offset
+-  printf("%04zu  ", offset);  // NOLINT
++  printf("%04zu  ", offset);  // NOLINT(hicpp-vararg)
+ 
+   const auto instruction = code_[offset];
+-  switch (instruction)  // NOLINT
++  switch (instruction)  // NOLINT(hicpp-multiway-paths-covered)
+   {
+     case OpCode::opReturn:
+       return printSimpleInstruction("return", offset);
+@@ -440,7 +445,7 @@ std::size_t Chunk::disassembleInstruction(std::size_t offset) const
+       return printSimpleInstruction("between", offset);
+ 
+     default:
+-      printf("Unknown opcode %d\n", instruction);  // NOLINT
++      printf("Unknown opcode %d\n", instruction);  // NOLINT(hicpp-vararg)
+       return offset + 1;
+   }
+ }
+@@ -479,65 +484,71 @@ uint8_t Chunk::getOrRegisterVariable(const std::string& name)
+ 
+ std::size_t Chunk::printSimpleInstruction(std::string_view name, std::size_t offset) const
+ {
+-  printf("%s\n", name.data());  // NOLINT
++  printf("%s\n", name.data());  // NOLINT(hicpp-vararg)
+   return offset + 1U;
+ }
+ 
+ std::size_t Chunk::printConstantInstruction(std::string_view name, std::size_t offset) const
+ {
+   auto constantIndex = code_[offset + 1];
+-  printf("%-16s %04u '", name.data(), constantIndex);  // NOLINT
++  printf("%-16s %04u '", name.data(), constantIndex);  // NOLINT(hicpp-vararg)
+   printValue(constants_[constantIndex]);
+-  printf("'\n");       // NOLINT
++  printf("'\n");       // NOLINT(hicpp-vararg)
+   return offset + 2U;  // one instruction + one operand
+ }
+ 
+ std::size_t Chunk::printJumpInstruction(std::string_view name, std::size_t offset) const
+ {
+-  auto jump = (uint16_t)(code_[offset + 1] << 8);  // NOLINT
++  auto jump = (uint16_t)(code_[offset + 1] << 8);  // NOLINT(google-readability-casting)
+   jump |= code_[offset + 2];
+-  printf("%-16s %04zu -> %04zu\n", name.data(), offset, offset + 3 + jump);  // NOLINT
++  printf("%-16s %04zu -> %04zu\n", name.data(), offset, offset + 3 + jump);  // NOLINT(hicpp-vararg)
+   return offset + 3;
+ }
+ 
+ std::size_t Chunk::printVariableInstruction(std::size_t offset) const
+ {
+   auto variableIndex = code_[offset + 1];
+-  printf("fetch_variable   %04u '%s'\n", variableIndex, variablesDef_[variableIndex].c_str());  // NOLINT
++  printf("fetch_variable   %04u '%s'\n", variableIndex, variablesDef_[variableIndex].c_str());  // NOLINT(hicpp-vararg)
+   return offset + 2U;
+ }
+ 
+ void Chunk::printValue(const Value& value)
+ {
++  if (holds<std::monostate>(value))
++  {
++    printf("<empty>");  // NOLINT(hicpp-vararg)
++    return;
++  }
++
+   if (holds<bool>(value))
+   {
+-    printf("<bool> %s", extract<bool>(value) ? "true" : "false");  // NOLINT
++    printf("<bool> %s", extract<bool>(value) ? "true" : "false");  // NOLINT(hicpp-vararg)
+     return;
+   }
+ 
+   if (holds<std::string>(value))
+   {
+-    printf("<str> %s", extract<std::string>(value).c_str());  // NOLINT
++    printf("<str> %s", extract<std::string>(value).c_str());  // NOLINT(hicpp-vararg)
+     return;
+   }
+ 
+-  // NOLINTNEXTLINE
++  // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+ #define PRINT_NUMBER(type)                                                                                             \
+   if (holds<type>(value))                                                                                              \
+   {                                                                                                                    \
+-    printf("<%s> %s", #type, std::to_string(extract<type>(value)).c_str());                                            \
++    printf("<%s> %s", #type, std::to_string(extract<type>(value)).c_str()); /* NOLINT(hicpp-vararg) */                 \
+     return;                                                                                                            \
+   }
+ 
+-  PRINT_NUMBER(i32)  // NOLINT
+-  PRINT_NUMBER(u32)  // NOLINT
+-  PRINT_NUMBER(i64)  // NOLINT
+-  PRINT_NUMBER(u64)  // NOLINT
+-  PRINT_NUMBER(f32)  // NOLINT
+-  PRINT_NUMBER(f64)  // NOLINT
+-  PRINT_NUMBER(u8)   // NOLINT
+-  PRINT_NUMBER(i16)  // NOLINT
+-  PRINT_NUMBER(u16)  // NOLINT
++  PRINT_NUMBER(i32)  // NOLINT(hicpp-vararg)
++  PRINT_NUMBER(u32)  // NOLINT(hicpp-vararg)
++  PRINT_NUMBER(i64)  // NOLINT(hicpp-vararg)
++  PRINT_NUMBER(u64)  // NOLINT(hicpp-vararg)
++  PRINT_NUMBER(f32)  // NOLINT(hicpp-vararg)
++  PRINT_NUMBER(f64)  // NOLINT(hicpp-vararg)
++  PRINT_NUMBER(u8)   // NOLINT(hicpp-vararg)
++  PRINT_NUMBER(i16)  // NOLINT(hicpp-vararg)
++  PRINT_NUMBER(u16)  // NOLINT(hicpp-vararg)
+ 
+ #undef PRINT_NUMBER
+ 
+@@ -684,6 +695,12 @@ void VM::negate()
+ {
+   auto value = pop();
+ 
++  if (holds<std::monostate>(value))
++  {
++    push(std::monostate {});
++    return;
++  }
++
+   if (holds<bool>(value))
+   {
+     push(!extract<bool>(value));
+@@ -782,23 +799,34 @@ void VM::greaterOrEqualThan()
+   comparisonOperation(a, b, std::greater_equal<>());
+ }
+ 
++namespace
++{
++
++/// Coerce a `Value` to `bool`, treating `std::monostate` (empty optional) as `false`.
++[[nodiscard]] inline bool valueAsBool(const Value& value)
++{
++  return holds<std::monostate>(value) ? false : extract<bool>(value);
++}
++
++}  // namespace
++
+ void VM::doAnd()
+ {
+   const auto b = pop();
+   const auto a = pop();
+-  push(extract<bool>(a) && extract<bool>(b));
++  push(valueAsBool(a) && valueAsBool(b));
+ }
+ 
+ void VM::doOr()
+ {
+   const auto b = pop();
+   const auto a = pop();
+-  push(extract<bool>(a) || extract<bool>(b));
++  push(valueAsBool(a) || valueAsBool(b));
+ }
+ 
+ void VM::jumpIfFalse(uint16_t offset)
+ {
+-  if (!extract<bool>(stack_.top()))
++  if (!valueAsBool(stack_.top()))
+   {
+     ip_ += offset;  // NOLINT
+   }
+@@ -806,7 +834,7 @@ void VM::jumpIfFalse(uint16_t offset)
+ 
+ void VM::jumpIfTrue(uint16_t offset)
+ {
+-  if (extract<bool>(stack_.top()))
++  if (valueAsBool(stack_.top()))
+   {
+     ip_ += offset;  // NOLINT
+   }
+@@ -870,6 +898,12 @@ void VM::mathOperation(const Value& a, const Value& b, C op)  // NOLINT
+     return;
+   }
+ 
++  if (holds<std::monostate>(a) || holds<std::monostate>(b))
++  {
++    push(std::monostate {});
++    return;
++  }
++
+   // NOLINTNEXTLINE
+ #define CAST_RHS(rhsType)                                                                                              \
+   if (holds<rhsType>(b))                                                                                               \
+diff --git a/libs/core/src/obj/object_filter.cpp b/libs/core/src/obj/object_filter.cpp
+index 3aa68c6..2628585 100644
+--- a/libs/core/src/obj/object_filter.cpp
++++ b/libs/core/src/obj/object_filter.cpp
+@@ -301,7 +301,8 @@ private:
+     {
+       track.alreadyEvaluatedOnce = true;
+       lang::VM vm;
+-      return std::get<bool>(vm.interpret(queryCode, track.environment).getValue());
++      const auto result = vm.interpret(queryCode, track.environment).getValue();
++      return std::holds_alternative<bool>(result) && std::get<bool>(result);
+     }
+ 
+     // keep the same previous result
+diff --git a/libs/core/test/lang/compiler_test.cpp b/libs/core/test/lang/compiler_test.cpp
+index e00d123..cf46f6f 100644
+--- a/libs/core/test/lang/compiler_test.cpp
++++ b/libs/core/test/lang/compiler_test.cpp
+@@ -269,6 +269,68 @@ TEST(Compiler, variables2)
+   }
+ }
+ 
++/// @test
++/// Checks that `std::monostate` in the environment (our "empty optional" marker) makes the
++/// WHERE clause evaluate to `false` without throwing, regardless of which side of the
++/// comparison or boolean operator it lands on.
++/// @requirements(SEN-363)
++TEST(Compiler, emptyOptionalYieldsFalse)
++{
++  // `count > 10` with an empty optional evaluates to false.
++  {
++    std::string program = R"(SELECT foo.Bar FROM s.b WHERE count > 10)";
++
++    VM vm;
++    auto result = vm.compile(vm.parse(program));
++    EXPECT_TRUE(result.isOk());
++    auto chunk = std::move(result).getValue();
++
++    std::vector<sen::lang::ValueGetter> environment = {[]() -> sen::lang::Value { return std::monostate {}; }};
++    auto codeResult = vm.interpret(chunk, environment);
++
++    EXPECT_TRUE(codeResult.isOk());
++    EXPECT_TRUE(std::holds_alternative<bool>(codeResult.getValue()));
++    EXPECT_FALSE(std::get<bool>(codeResult.getValue()));
++  }
++
++  // Empty AND anything -> false (short-circuits on the empty).
++  {
++    std::string program = R"(SELECT foo.Bar FROM s.b WHERE count > 0 AND other = "x")";
++
++    VM vm;
++    auto result = vm.compile(vm.parse(program));
++    EXPECT_TRUE(result.isOk());
++    auto chunk = std::move(result).getValue();
++
++    std::vector<sen::lang::ValueGetter> environment = {
++      []() -> sen::lang::Value { return std::monostate {}; },
++      []() -> sen::lang::Value { return std::string("x"); },
++    };
++    auto codeResult = vm.interpret(chunk, environment);
++
++    EXPECT_TRUE(codeResult.isOk());
++    EXPECT_TRUE(std::holds_alternative<bool>(codeResult.getValue()));
++    EXPECT_FALSE(std::get<bool>(codeResult.getValue()));
++  }
++
++  // Empty on the RHS of a comparison is also false.
++  {
++    std::string program = R"(SELECT foo.Bar FROM s.b WHERE 10 < count)";
++
++    VM vm;
++    auto result = vm.compile(vm.parse(program));
++    EXPECT_TRUE(result.isOk());
++    auto chunk = std::move(result).getValue();
++
++    std::vector<sen::lang::ValueGetter> environment = {[]() -> sen::lang::Value { return std::monostate {}; }};
++    auto codeResult = vm.interpret(chunk, environment);
++
++    EXPECT_TRUE(codeResult.isOk());
++    EXPECT_TRUE(std::holds_alternative<bool>(codeResult.getValue()));
++    EXPECT_FALSE(std::get<bool>(codeResult.getValue()));
++  }
++}
++
+ /// @test
+ /// Checks incorrect program definition in vm compiler
+ /// @requirements(SEN-363)
+diff --git a/libs/core/test/obj/object_filter_test.cpp b/libs/core/test/obj/object_filter_test.cpp
+index dfddaa7..89cdff9 100644
+--- a/libs/core/test/obj/object_filter_test.cpp
++++ b/libs/core/test/obj/object_filter_test.cpp
+@@ -123,7 +123,7 @@ sen::impl::RemoteObjectInfo createTestProxyInfo()
+ /// Validates that creating and removing a named provider works as expected and returns the exact same instance if
+ /// requested multiple times
+ /// @requirements(SEN-363)
+-TEST(ObjectFilter, NamedProvider_CreateAndRemove)
++TEST(ObjectFilter, namedProviderCreateAndRemove)
+ {
+   TestObjectFilter filter(getTestOwnerId());
+   const auto interest = createEmptyInterest();
+@@ -143,7 +143,7 @@ TEST(ObjectFilter, NamedProvider_CreateAndRemove)
+ /// @test
+ /// Verifies that creating a named provider with conflicting names but the same interest throws an error
+ /// @requirements(SEN-363)
+-TEST(ObjectFilter, NamedProvider_ConflictThrows)
++TEST(ObjectFilter, namedProviderConflictThrows)
+ {
+   TestObjectFilter filter(getTestOwnerId());
+   const auto interest = createEmptyInterest();
+@@ -158,7 +158,7 @@ TEST(ObjectFilter, NamedProvider_ConflictThrows)
+ /// Ensures that if an unnamed provider exists for an interest, creating a named provider with that same interest
+ /// correctly assigns the name to the existing provider instead of creating a duplicate
+ /// @requirements(SEN-363)
+-TEST(ObjectFilter, NamedProvider_AssignsNameToExistingUnnamedProvider)
++TEST(ObjectFilter, namedProviderAssignsNameToExistingUnnamedProvider)
+ {
+   TestObjectFilter filter(getTestOwnerId());
+   const auto interest = createEmptyInterest();
+@@ -173,7 +173,7 @@ TEST(ObjectFilter, NamedProvider_AssignsNameToExistingUnnamedProvider)
+ /// @test
+ /// Validates adding and removing subscribers from the filter and ensures no updates are received post removal
+ /// @requirements(SEN-363)
+-TEST(ObjectFilter, Subscriber_AddAndRemove)
++TEST(ObjectFilter, subscriberAddAndRemove)
+ {
+   TestObjectFilter filter(getTestOwnerId());
+   auto interest = createEmptyInterest();
+@@ -207,7 +207,7 @@ TEST(ObjectFilter, Subscriber_AddAndRemove)
+ /// @test
+ /// Validates removing a subscriber using only the listener pointer cleans up correctly
+ /// @requirements(SEN-363)
+-TEST(ObjectFilter, Subscriber_RemoveByListener)
++TEST(ObjectFilter, subscriberRemoveByListener)
+ {
+   TestObjectFilter filter(getTestOwnerId());
+   auto interest = createEmptyInterest();
+@@ -229,7 +229,7 @@ TEST(ObjectFilter, Subscriber_RemoveByListener)
+ /// @test
+ /// Checks that objects are properly tracked on creation and untracked when formally deleted from the set
+ /// @requirements(SEN-363)
+-TEST(ObjectFilter, Evaluate_AddsAndRemoves)
++TEST(ObjectFilter, evaluateAddsAndRemoves)
+ {
+   TestObjectFilter filter(getTestOwnerId());
+   auto interest = createEmptyInterest();
+@@ -260,7 +260,7 @@ TEST(ObjectFilter, Evaluate_AddsAndRemoves)
+ /// @test
+ /// Confirms that evaluate properly ignores incoming objects that evaluate as native proxy instances
+ /// @requirements(SEN-363)
+-TEST(ObjectFilter, Evaluate_IgnoresNonNativeObjects)
++TEST(ObjectFilter, evaluateIgnoresNonNativeObjects)
+ {
+   TestObjectFilter filter(getTestOwnerId());
+   auto interest = createEmptyInterest();
+@@ -280,7 +280,7 @@ TEST(ObjectFilter, Evaluate_IgnoresNonNativeObjects)
+ /// @test
+ /// Verifies evaluate safely ignores duplicates in newObjects if an object is already tracked
+ /// @requirements(SEN-363)
+-TEST(ObjectFilter, Evaluate_IgnoresDuplicateTrackedObjects)
++TEST(ObjectFilter, evaluateIgnoresDuplicateTrackedObjects)
+ {
+   TestObjectFilter filter(getTestOwnerId());
+   auto interest = createEmptyInterest();
+@@ -302,7 +302,7 @@ TEST(ObjectFilter, Evaluate_IgnoresDuplicateTrackedObjects)
+ /// @test
+ /// Verifies evaluate safely skips processing deleted objects that the provider isn't currently tracking
+ /// @requirements(SEN-363)
+-TEST(ObjectFilter, Evaluate_IgnoresUntrackedDeletedObjects)
++TEST(ObjectFilter, evaluateIgnoresUntrackedDeletedObjects)
+ {
+   TestObjectFilter filter(getTestOwnerId());
+   auto interest = createEmptyInterest();
+@@ -319,7 +319,7 @@ TEST(ObjectFilter, Evaluate_IgnoresUntrackedDeletedObjects)
+ /// @test
+ /// Validates filtering strictly based on ClassType condition enforcing type safety in subscriptions
+ /// @requirements(SEN-363)
+-TEST(ObjectFilter, Evaluate_TypeCondition_ClassType)
++TEST(ObjectFilter, evaluateTypeConditionClassType)
+ {
+   TestObjectFilter filter(getTestOwnerId());
+   auto interest = createInterestWithRegistry("SELECT example_class.ExampleClass FROM session.bus");
+@@ -340,7 +340,7 @@ TEST(ObjectFilter, Evaluate_TypeCondition_ClassType)
+ /// @test
+ /// Validates filtering when the class name is not recognized during registration, triggering a string based type check
+ /// @requirements(SEN-363)
+-TEST(ObjectFilter, Evaluate_TypeCondition_StringCondition)
++TEST(ObjectFilter, evaluateTypeConditionStringCondition)
+ {
+   TestObjectFilter filter(getTestOwnerId());
+   sen::CustomTypeRegistry emptyTypes;
+@@ -363,7 +363,7 @@ TEST(ObjectFilter, Evaluate_TypeCondition_StringCondition)
+ /// Validates dynamic evaluation via query conditions that involve object properties, responding seamlessly to property
+ /// updates
+ /// @requirements(SEN-363)
+-TEST(ObjectFilter, Evaluate_QueryCondition_UpdatesOnPropertyChange)
++TEST(ObjectFilter, evaluateQueryConditionUpdatesOnPropertyChange)
+ {
+   TestObjectFilter filter(getTestOwnerId());
+   auto interest = createInterestWithRegistry("SELECT * FROM session.bus WHERE prop2 > 10");
+@@ -401,10 +401,54 @@ TEST(ObjectFilter, Evaluate_QueryCondition_UpdatesOnPropertyChange)
+   EXPECT_EQ(listener.removed[0], obj->getId());
+ }
+ 
++/// @test
++/// Empty optional properties in a WHERE clause evaluate to `false`, matching the documented
++/// "absent optional excludes the object" semantics. A present optional compares normally.
++/// @requirements(SEN-363)
++TEST(ObjectFilter, evaluateQueryConditionOptionalProperty)
++{
++  TestObjectFilter filter(getTestOwnerId());
++  auto interest = createInterestWithRegistry("SELECT * FROM session.bus WHERE prop3 > 10");
++
++  MockListener listener;
++  filter.addSubscriber(interest, &listener, false);
++
++  auto obj = std::make_shared<TestOwner>("TestObj1");
++  // prop3 starts empty: WHERE comparison must yield false regardless of the operator.
++  obj->commit(sen::TimeStamp {100});
++
++  TestObjectFilter::ObjectSet set;
++  set.newObjects[obj->getId()] = obj;
++  set.currentObjects[obj->getId()] = obj;
++  filter.evaluate(set);
++
++  EXPECT_TRUE(listener.added.empty());
++
++  // Make prop3 present and matching.
++  obj->setNextProp3(example_class::MaybeCount {42U});
++  obj->commit(sen::TimeStamp {200});
++
++  TestObjectFilter::ObjectSet evalSet;
++  evalSet.currentObjects[obj->getId()] = obj;
++  filter.evaluate(evalSet);
++
++  EXPECT_EQ(listener.added.size(), 1U);
++  EXPECT_EQ(listener.added[0], obj->getId());
++
++  // Clear prop3 again: object must be removed from the match set.
++  obj->setNextProp3(example_class::MaybeCount {});
++  obj->commit(sen::TimeStamp {300});
++
++  filter.evaluate(evalSet);
++
++  EXPECT_EQ(listener.removed.size(), 1U);
++  EXPECT_EQ(listener.removed[0], obj->getId());
++}
++
+ /// @test
+ /// Validates that queries filtering natively using the id keyword function correctly
+ /// @requirements(SEN-363)
+-TEST(ObjectFilter, Evaluate_QueryCondition_IdKeyword)
++TEST(ObjectFilter, evaluateQueryConditionIdKeyword)
+ {
+   TestObjectFilter filter(getTestOwnerId());
+   auto interest = createInterestWithRegistry("SELECT * FROM session.bus WHERE id = 123");
+@@ -428,7 +472,7 @@ TEST(ObjectFilter, Evaluate_QueryCondition_IdKeyword)
+ /// Ensures that queries attempting to access non-existent variables are marked invalid and fail securely without
+ /// crashing
+ /// @requirements(SEN-363)
+-TEST(ObjectFilter, Evaluate_InvalidQueryHandledSafely)
++TEST(ObjectFilter, evaluateInvalidQueryHandledSafely)
+ {
+   TestObjectFilter filter(getTestOwnerId());
+   auto interest = createInterestWithRegistry("SELECT * FROM session.bus WHERE nonExistentProperty > 10");
+@@ -449,7 +493,7 @@ TEST(ObjectFilter, Evaluate_InvalidQueryHandledSafely)
+ /// @test
+ /// Verifies the coverage of base empty virtual methods within ObjectFilter
+ /// @requirements(SEN-363)
+-TEST(ObjectFilter, BaseVirtualMethods)
++TEST(ObjectFilter, baseVirtualMethods)
+ {
+   TestObjectFilter filter(getTestOwnerId());
+   const auto interest = createEmptyInterest();
+@@ -468,7 +512,7 @@ TEST(ObjectFilter, BaseVirtualMethods)
+ /// Verifies that when a listener is attached to a named provider with notification enabled,
+ /// the provider correctly notifies the new listener of already existing matched objects
+ /// @requirements(SEN-363)
+-TEST(ObjectFilter, NamedProvider_NotifyAddedOnExistingObjects)
++TEST(ObjectFilter, namedProviderNotifyAddedOnExistingObjects)
+ {
+   TestObjectFilter filter(getTestOwnerId());
+   const auto interest = createEmptyInterest();
+@@ -495,7 +539,7 @@ TEST(ObjectFilter, NamedProvider_NotifyAddedOnExistingObjects)
+ /// @test
+ /// Validates that queries filtering natively using the name keyword function correctly
+ /// @requirements(SEN-363)
+-TEST(ObjectFilter, Evaluate_QueryCondition_NameKeyword)
++TEST(ObjectFilter, evaluateQueryConditionNameKeyword)
+ {
+   TestObjectFilter filter(getTestOwnerId());
+   auto interest = createInterestWithRegistry(R"(SELECT * FROM session.bus WHERE name = "TestObj1")");
+@@ -524,7 +568,7 @@ TEST(ObjectFilter, Evaluate_QueryCondition_NameKeyword)
+ /// Validates that an object's query condition is not re-evaluated if its dependent properties
+ /// have not changed in the current cycle, safely returning the notified state
+ /// @requirements(SEN-363)
+-TEST(ObjectFilter, Evaluate_ReturnsCachedResultWhenUnchanged)
++TEST(ObjectFilter, evaluateReturnsCachedResultWhenUnchanged)
+ {
+   TestObjectFilter filter(getTestOwnerId());
+   auto interest = createInterestWithRegistry("SELECT * FROM session.bus WHERE prop2 > 10");
+@@ -578,7 +622,7 @@ TEST(ObjectFilter, Evaluate_ReturnsCachedResultWhenUnchanged)
+ /// Ensures that removing a named provider correctly iterates through the providers list when the target provider
+ /// is not the first one
+ /// @requirements(SEN-363)
+-TEST(ObjectFilter, NamedProvider_RemoveIteratesCorrectly)
++TEST(ObjectFilter, namedProviderRemoveIteratesCorrectly)
+ {
+   TestObjectFilter filter(getTestOwnerId());
+ 
+@@ -595,7 +639,7 @@ TEST(ObjectFilter, NamedProvider_RemoveIteratesCorrectly)
+ /// Verifies that removeSubscriber safely skips expired weak_ptrs if a provider gets deleted during the iteration
+ /// of the local providers copy
+ /// @requirements(SEN-363)
+-TEST(ObjectFilter, Subscriber_RemoveHandlesExpiredProvider)
++TEST(ObjectFilter, subscriberRemoveHandlesExpiredProvider)
+ {
+   TestObjectFilter filter(getTestOwnerId());
+ 
+@@ -625,7 +669,7 @@ TEST(ObjectFilter, Subscriber_RemoveHandlesExpiredProvider)
+ /// Verifies that removeSubscriber by interest safely skips expired weak_ptrs if a provider gets deleted
+ /// during the iteration of the local providers copy
+ /// @requirements(SEN-363)
+-TEST(ObjectFilter, Subscriber_RemoveWithInterestHandlesExpiredProvider)
++TEST(ObjectFilter, subscriberRemoveWithInterestHandlesExpiredProvider)
+ {
+   TestObjectFilter filter(getTestOwnerId());
+ 
+diff --git a/libs/core/test/obj/stl/example_class.stl b/libs/core/test/obj/stl/example_class.stl
+index eebc4e5..070a7ae 100644
+--- a/libs/core/test/obj/stl/example_class.stl
++++ b/libs/core/test/obj/stl/example_class.stl
+@@ -1,7 +1,10 @@
+ package example_class;
+ 
++optional<u32> MaybeCount;
++
+ class ExampleClass
+ {
+   var prop1 : string       [writable, confirmed];
+   var prop2 : u32          [writable];
++  var prop3 : MaybeCount   [writable];
+ }
+-- 
+2.51.0
+

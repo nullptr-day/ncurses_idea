@@ -1,0 +1,1693 @@
+From bb57f3384dc3d19789bdc778359ef5022ccb8636 Mon Sep 17 00:00:00 2001
+From: Enrique Parodi Spalazzi <enrique.parodi@airbus.com>
+Date: Fri, 24 Apr 2026 00:18:03 +0200
+Subject: [PATCH 03/10] feat[core/lang]: add query::complete() with positional
+ FSM
+
+Tab-completion surface for the query language. complete() walks a
+positional FSM (selectKeyword -> classPath -> fromKeyword -> ...)
+that tells it what the cursor can produce next, then emits
+context-aware candidates:
+
+- Class names prefixed by the registry's qualified names.
+- Session and bus names from BusLookup.
+- Keywords expected at the current slot (FROM, WHERE, AND, OR, BETWEEN,
+  IN, NOT, comparison operators).
+- Typed values: when the LHS of a comparison is a known property,
+  propose values of the right kind (enum labels for enum props,
+  booleans for bool props, quoted strings for string props, ...).
+
+Bundled hygiene refactors that came with complete: drop redundant name
+fields from completion variants, centralize token-to-lexeme mapping in
+lexemeOf(StlTokenType), and use lexemeOf for keyword completions
+instead of hard-coded strings.
+---
+ libs/core/CMakeLists.txt                      |   8 +-
+ .../include/sen/core/lang/query/complete.h    | 127 +++
+ libs/core/include/sen/core/lang/stl_token.h   |   7 +
+ libs/core/src/lang/query/complete.cpp         | 769 ++++++++++++++++++
+ libs/core/src/lang/query/tokenize.cpp         |  12 +-
+ libs/core/src/lang/stl_scanner.cpp            |  67 +-
+ libs/core/src/lang/stl_token.cpp              | 123 +++
+ libs/core/test/CMakeLists.txt                 |   9 +-
+ libs/core/test/lang/query/complete_test.cpp   | 410 ++++++++++
+ 9 files changed, 1463 insertions(+), 69 deletions(-)
+ create mode 100644 libs/core/include/sen/core/lang/query/complete.h
+ create mode 100644 libs/core/src/lang/query/complete.cpp
+ create mode 100644 libs/core/test/lang/query/complete_test.cpp
+
+diff --git a/libs/core/CMakeLists.txt b/libs/core/CMakeLists.txt
+index 8799379..9eee494 100644
+--- a/libs/core/CMakeLists.txt
++++ b/libs/core/CMakeLists.txt
+@@ -213,8 +213,11 @@ set(lang_public_headers
+     include/sen/core/lang/fom_parser.h
+ )
+ 
+-set(lang_query_public_headers include/sen/core/lang/query/bus_lookup.h include/sen/core/lang/query/tokenize.h
+-                               include/sen/core/lang/query/validate.h
++set(lang_query_public_headers
++    include/sen/core/lang/query/bus_lookup.h
++    include/sen/core/lang/query/complete.h
++    include/sen/core/lang/query/tokenize.h
++    include/sen/core/lang/query/validate.h
+ )
+ 
+ set(lang_sources
+@@ -228,6 +231,7 @@ set(lang_sources
+     src/lang/fom_document_set.cpp
+     src/lang/fom_document_set.h
+     src/lang/fom_parser.cpp
++    src/lang/query/complete.cpp
+     src/lang/query/tokenize.cpp
+     src/lang/query/validate.cpp
+ )
+diff --git a/libs/core/include/sen/core/lang/query/complete.h b/libs/core/include/sen/core/lang/query/complete.h
+new file mode 100644
+index 0000000..95bc437
+--- /dev/null
++++ b/libs/core/include/sen/core/lang/query/complete.h
+@@ -0,0 +1,127 @@
++// === complete.h ======================================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#ifndef SEN_CORE_LANG_QUERY_COMPLETE_H
++#define SEN_CORE_LANG_QUERY_COMPLETE_H
++
++// sen
++#include "sen/core/lang/code_location.h"
++#include "sen/core/lang/query/bus_lookup.h"
++#include "sen/core/meta/class_type.h"
++#include "sen/core/meta/property.h"
++#include "sen/core/meta/type.h"
++
++// std
++#include <cstddef>
++#include <memory>
++#include <string>
++#include <string_view>
++#include <variant>
++#include <vector>
++
++namespace sen
++{
++class CustomTypeRegistry;
++}
++
++namespace sen::lang::query
++{
++
++/// \addtogroup lang
++/// @{
++
++/// A reserved word or grammar-level literal symbol (including `*` in `SELECT *`). The text
++/// is the exact token that should be inserted; casing matches the grammar (upper for
++/// control keywords, lower for `true` / `false`).
++struct KeywordCompletion
++{
++  std::string text;
++};
++
++/// A class reachable from the `CustomTypeRegistry`. The text to insert is
++/// `type->getQualifiedName()`; the handle also gives consumers access to docs,
++/// properties, and inheritance without re-resolving the registry.
++struct ClassNameCompletion
++{
++  ConstTypeHandle<ClassType> type;
++};
++
++/// A session name discovered via `BusLookup::sessions`.
++struct SessionCompletion
++{
++  std::string name;
++};
++
++/// A bus name discovered via `BusLookup::buses(session)`. `session` is echoed back so the
++/// UI can label the completion in-context.
++struct BusCompletion
++{
++  std::string session;
++  std::string name;
++};
++
++/// A property of the selected class. The text to insert is `property->getName()`; the
++/// handle is kept alive by the caller registering the `ClassType`, so consumers can read
++/// its type, category, tags, etc.
++struct PropertyCompletion
++{
++  std::shared_ptr<const Property> property;
++};
++
++/// A value literal whose set of valid forms is enumerable (currently: enum values for an
++/// `EnumType` property). `text` is the literal as it should appear in the query (including
++/// surrounding quotes for string-shaped values). `valueType` is the meta type the value
++/// belongs to (typically the property's type) so consumers can filter or re-label.
++struct TypedValueCompletion
++{
++  std::string      text;
++  ConstTypeHandle<> valueType;
++};
++
++/// One completion candidate. The variant members are non-overlapping categories; consumers
++/// typically render them with distinct icons / grouping.
++using Completion = std::variant<KeywordCompletion,
++                                ClassNameCompletion,
++                                SessionCompletion,
++                                BusCompletion,
++                                PropertyCompletion,
++                                TypedValueCompletion>;
++
++/// Result of a completion request.
++///
++/// `replacement` is the text span in the source that a chosen completion should overwrite
++/// (an empty span at the cursor means "insert without replacing"). `items` is the list of
++/// candidates, filtered by whatever prefix the cursor is sitting on; order is left to the
++/// caller to re-sort / re-score.
++struct CompleteResult
++{
++  TextSpan                replacement = {};
++  std::vector<Completion> items = {};
++};
++
++/// Compute completion candidates at `cursor` inside `text`.
++///
++/// `cursor` is a byte offset in [0, text.size()]. Values past the end are clamped. The
++/// function tokenizes tolerantly, classifies the grammar slot at the cursor with a small
++/// positional FSM, then fills candidates by consulting `types` and `buses` for the slot
++/// (class names after `SELECT`, session names after `FROM`, bus names after `session.`,
++/// property names after `WHERE` on a known class, enum values on a typed RHS, etc.).
++///
++/// The returned `items` are already prefix-filtered against whatever partial word the
++/// cursor sits on; an empty prefix returns every candidate for the slot. Scope for this
++/// pass: single-segment property paths only (struct / variant field access deferred),
++/// typed-value completion for `EnumType` and `BoolType` properties only.
++[[nodiscard]] CompleteResult complete(std::string_view          text,
++                                      std::size_t               cursor,
++                                      const CustomTypeRegistry& types,
++                                      const BusLookup&          buses);
++
++/// @}
++
++}  // namespace sen::lang::query
++
++#endif  // SEN_CORE_LANG_QUERY_COMPLETE_H
+diff --git a/libs/core/include/sen/core/lang/stl_token.h b/libs/core/include/sen/core/lang/stl_token.h
+index 7d8ce75..f2d9e43 100644
+--- a/libs/core/include/sen/core/lang/stl_token.h
++++ b/libs/core/include/sen/core/lang/stl_token.h
+@@ -15,6 +15,7 @@
+ 
+ // std
+ #include <string>
++#include <string_view>
+ #include <vector>
+ 
+ namespace sen::lang
+@@ -122,6 +123,12 @@ std::string toString(const StlToken& token);
+ 
+ std::string toString(StlTokenType type);
+ 
++/// Canonical lexeme for token types with a fixed spelling (keywords, punctuation,
++/// operators). Returns an empty view for dynamic-lexeme types (identifier, string,
++/// numeric, comment, endOfFile, invalidChar, partialString), whose text is
++/// per-token rather than grammar-wide.
++[[nodiscard]] std::string_view lexemeOf(StlTokenType type) noexcept;
++
+ using StlTokenList = std::vector<StlToken>;
+ 
+ /// @}
+diff --git a/libs/core/src/lang/query/complete.cpp b/libs/core/src/lang/query/complete.cpp
+new file mode 100644
+index 0000000..cd5ddd1
+--- /dev/null
++++ b/libs/core/src/lang/query/complete.cpp
+@@ -0,0 +1,769 @@
++// === complete.cpp ====================================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#include "sen/core/lang/query/complete.h"
++
++// sen
++#include "sen/core/lang/stl_scanner.h"
++#include "sen/core/lang/stl_token.h"
++#include "sen/core/meta/alias_type.h"
++#include "sen/core/meta/class_type.h"
++#include "sen/core/meta/enum_type.h"
++#include "sen/core/meta/property.h"
++#include "sen/core/meta/type.h"
++#include "sen/core/meta/type_registry.h"
++
++// std
++#include <algorithm>
++#include <cstddef>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace sen::lang::query
++{
++
++namespace
++{
++
++/// Re-scan of the source with byte-accurate spans. Shares its span-reconstruction logic
++/// with `tokenize.cpp` but keeps the raw `StlTokenType` so the FSM can distinguish
++/// `keywordSelect` from `keywordFrom` without re-parsing lexemes. Comments and EOF are
++/// dropped here; the FSM never needs them.
++struct FsmToken
++{
++  StlTokenType type = StlTokenType::endOfFile;
++  TextSpan     span = {};
++  std::string  lexeme = {};
++};
++
++[[nodiscard]] bool isWhitespace(char c) noexcept { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
++
++[[nodiscard]] std::vector<FsmToken> scan(std::string_view text)
++{
++  const std::string source(text);
++  StlScanner        scanner(source, ScanMode::tolerant);
++  const auto&       raw = scanner.scanTokens();
++
++  std::vector<FsmToken> out;
++  out.reserve(raw.size());
++
++  std::size_t cursor = 0U;
++  for (const auto& t: raw)
++  {
++    while (cursor < source.size() && isWhitespace(source[cursor]))
++    {
++      ++cursor;
++    }
++    std::size_t       end = t.loc.offset;
++    const std::size_t rawBegin = (cursor <= end) ? cursor : end;
++
++    if (t.type == StlTokenType::comment || t.type == StlTokenType::endOfFile)
++    {
++      cursor = end;
++      continue;
++    }
++
++    // The scanner's `number()` consumes trailing whitespace (legacy support for
++    // `- 5` signed numerics). Trim it off so the reconstructed span ends at the
++    // last actual token character.
++    while (end > rawBegin && isWhitespace(source[end - 1U]))
++    {
++      --end;
++    }
++
++    FsmToken f;
++    f.type = t.type;
++    f.span = TextSpan {rawBegin, end};
++    f.lexeme = (end > rawBegin) ? source.substr(rawBegin, end - rawBegin) : std::string {};
++    out.push_back(std::move(f));
++    cursor = t.loc.offset;
++  }
++  return out;
++}
++
++/// Tokens that are "word-like" — the cursor sitting inside or immediately after one of
++/// these is editing that word.
++[[nodiscard]] bool isEditableToken(StlTokenType t) noexcept
++{
++  switch (t)
++  {
++    case StlTokenType::identifier:
++    case StlTokenType::string:
++    case StlTokenType::partialString:
++    case StlTokenType::real:
++    case StlTokenType::integral:
++    case StlTokenType::invalidChar:
++      return true;
++    default:
++      break;
++  }
++  // All keyword* token types are editable (user may be mid-typing a keyword).
++  if (t >= StlTokenType::keywordAbstract && t <= StlTokenType::keywordBetween)
++  {
++    return true;
++  }
++  return false;
++}
++
++/// Locate the token being edited, if any. Returns an index into `tokens` or `tokens.size()`
++/// when the cursor is between tokens (user is starting a new word).
++[[nodiscard]] std::size_t findCurrentToken(const std::vector<FsmToken>& tokens, std::size_t cursor) noexcept
++{
++  for (std::size_t i = 0U; i < tokens.size(); ++i)
++  {
++    const auto& t = tokens[i];
++    if (cursor > t.span.begin && cursor <= t.span.end && isEditableToken(t.type))
++    {
++      return i;
++    }
++  }
++  return tokens.size();
++}
++
++/// Grammar slots the cursor can be in. Each slot drives which completion kinds we emit.
++enum class Slot
++{
++  selectKeyword,      /// start of query; want `SELECT`
++  classPath,          /// after `SELECT` or a `.` in the class path
++  classPathTail,      /// after a class-name identifier; want `.` or `FROM`
++  fromKeyword,        /// after `SELECT *`; want `FROM`
++  sessionName,        /// after `FROM`
++  busDot,             /// after `<session>`; want `.`
++  busName,            /// after `<session>.`
++  whereOrEnd,         /// after `<session>.<bus>`; want `WHERE` or end
++  whereExpr,          /// start of an expression (fresh, after AND/OR, after `(`, after NOT)
++  binaryOp,           /// after a "value" in an expression
++  literal,            /// after a comparison op; want a value (typed if we know the LHS)
++  afterNotInExpr,     /// saw `NOT` in binaryOp slot; expect `BETWEEN` / `IN` / expression
++  betweenFirst,       /// after `BETWEEN`; want the min value
++  betweenAnd,         /// after `BETWEEN <lit>`; want structural `AND`
++  betweenSecond,      /// after `BETWEEN <lit> AND`; want the max value
++  inOpenParen,        /// after `IN` / `NOT IN`; want `(`
++  inListElem,         /// inside `IN (...)`; want a value
++  inListSepOrClose,   /// after a value in `IN (...)`; want `,` or `)`
++  done,               /// no useful suggestions
++};
++
++/// Decide whether a token behaves as a "value" in an expression (an operand). Strings,
++/// numbers, booleans, identifiers — parenthesized groups close into this too via `)`.
++[[nodiscard]] bool isValueStart(StlTokenType t) noexcept
++{
++  switch (t)
++  {
++    case StlTokenType::identifier:
++    case StlTokenType::string:
++    case StlTokenType::partialString:
++    case StlTokenType::integral:
++    case StlTokenType::real:
++    case StlTokenType::keywordTrue:
++    case StlTokenType::keywordFalse:
++      return true;
++    default:
++      return false;
++  }
++}
++
++/// Pair of (slot, lhsProperty). The property is set while transitioning from binaryOp
++/// into literal / betweenFirst / inListElem when we can tie the LHS to a known class
++/// property — so typed-value completion has something to consult.
++struct FsmState
++{
++  Slot                              slot = Slot::selectKeyword;
++  std::shared_ptr<const Property>   lhsProperty = nullptr;
++  std::string                       lastIdentifier = {};  /// raw lexeme of the last value identifier
++  std::string                       sessionName = {};     /// captured between FROM and the session dot
++};
++
++/// Walk tokens and advance the FSM. Returns the state "waiting at" the end of the walk —
++/// that's what the cursor is pointed at.
++void step(FsmState& s, const FsmToken& t, const ClassType* cls)
++{
++  const auto type = t.type;
++  switch (s.slot)
++  {
++    case Slot::selectKeyword:
++      if (type == StlTokenType::keywordSelect)
++      {
++        s.slot = Slot::classPath;
++      }
++      break;
++
++    case Slot::classPath:
++      if (type == StlTokenType::star)
++      {
++        s.slot = Slot::fromKeyword;
++      }
++      else if (type == StlTokenType::identifier)
++      {
++        s.slot = Slot::classPathTail;
++      }
++      break;
++
++    case Slot::classPathTail:
++      if (type == StlTokenType::dot)
++      {
++        s.slot = Slot::classPath;
++      }
++      else if (type == StlTokenType::keywordFrom)
++      {
++        s.slot = Slot::sessionName;
++      }
++      break;
++
++    case Slot::fromKeyword:
++      if (type == StlTokenType::keywordFrom)
++      {
++        s.slot = Slot::sessionName;
++      }
++      break;
++
++    case Slot::sessionName:
++      if (type == StlTokenType::identifier)
++      {
++        s.sessionName = t.lexeme;
++        s.slot = Slot::busDot;
++      }
++      break;
++
++    case Slot::busDot:
++      if (type == StlTokenType::dot)
++      {
++        s.slot = Slot::busName;
++      }
++      break;
++
++    case Slot::busName:
++      if (type == StlTokenType::identifier)
++      {
++        s.slot = Slot::whereOrEnd;
++      }
++      break;
++
++    case Slot::whereOrEnd:
++      if (type == StlTokenType::keywordWhere)
++      {
++        s.slot = Slot::whereExpr;
++      }
++      break;
++
++    case Slot::whereExpr:
++      if (type == StlTokenType::keywordNot || type == StlTokenType::bang || type == StlTokenType::minus ||
++          type == StlTokenType::plus)
++      {
++        // unary prefix; stay in whereExpr
++      }
++      else if (type == StlTokenType::leftParen)
++      {
++        // enter a parenthesized sub-expression; stay in whereExpr
++      }
++      else if (type == StlTokenType::rightParen)
++      {
++        s.slot = Slot::binaryOp;
++      }
++      else if (isValueStart(type))
++      {
++        if (type == StlTokenType::identifier && cls != nullptr)
++        {
++          const Property* p = cls->searchPropertyByName(t.lexeme);
++          if (p != nullptr)
++          {
++            // searchPropertyByName returns a raw pointer; getProperties returns shared_ptrs.
++            // Look up the shared_ptr to carry meta handle through to typed-value completion.
++            const auto all = cls->getProperties(ClassType::SearchMode::includeParents);
++            for (const auto& sp: all)
++            {
++              if (sp.get() == p)
++              {
++                s.lhsProperty = sp;
++                break;
++              }
++            }
++          }
++          else
++          {
++            s.lhsProperty.reset();
++          }
++          s.lastIdentifier = t.lexeme;
++        }
++        else
++        {
++          s.lhsProperty.reset();
++          s.lastIdentifier = {};
++        }
++        s.slot = Slot::binaryOp;
++      }
++      break;
++
++    case Slot::binaryOp:
++      if (type == StlTokenType::keywordAnd || type == StlTokenType::keywordOr)
++      {
++        s.lhsProperty.reset();
++        s.lastIdentifier = {};
++        s.slot = Slot::whereExpr;
++      }
++      else if (type == StlTokenType::keywordBetween)
++      {
++        s.slot = Slot::betweenFirst;
++      }
++      else if (type == StlTokenType::keywordIn)
++      {
++        s.slot = Slot::inOpenParen;
++      }
++      else if (type == StlTokenType::keywordNot)
++      {
++        s.slot = Slot::afterNotInExpr;
++      }
++      else if (type == StlTokenType::equal || type == StlTokenType::equalEqual || type == StlTokenType::bangEqual ||
++               type == StlTokenType::less || type == StlTokenType::lessEqual || type == StlTokenType::greater ||
++               type == StlTokenType::greaterEqual)
++      {
++        s.slot = Slot::literal;
++      }
++      else if (type == StlTokenType::plus || type == StlTokenType::minus || type == StlTokenType::star ||
++               type == StlTokenType::slash)
++      {
++        s.lhsProperty.reset();
++        s.lastIdentifier = {};
++        s.slot = Slot::whereExpr;
++      }
++      else if (type == StlTokenType::rightParen)
++      {
++        // still a value-ish position, stay
++      }
++      break;
++
++    case Slot::literal:
++      if (isValueStart(type))
++      {
++        s.slot = Slot::binaryOp;
++      }
++      else if (type == StlTokenType::minus || type == StlTokenType::plus)
++      {
++        // unary sign on numeric literal; stay
++      }
++      break;
++
++    case Slot::afterNotInExpr:
++      if (type == StlTokenType::keywordBetween)
++      {
++        s.slot = Slot::betweenFirst;
++      }
++      else if (type == StlTokenType::keywordIn)
++      {
++        s.slot = Slot::inOpenParen;
++      }
++      else
++      {
++        s.slot = Slot::done;
++      }
++      break;
++
++    case Slot::betweenFirst:
++      if (isValueStart(type))
++      {
++        s.slot = Slot::betweenAnd;
++      }
++      break;
++
++    case Slot::betweenAnd:
++      if (type == StlTokenType::keywordAnd)
++      {
++        s.slot = Slot::betweenSecond;
++      }
++      break;
++
++    case Slot::betweenSecond:
++      if (isValueStart(type))
++      {
++        s.slot = Slot::binaryOp;
++      }
++      break;
++
++    case Slot::inOpenParen:
++      if (type == StlTokenType::leftParen)
++      {
++        s.slot = Slot::inListElem;
++      }
++      break;
++
++    case Slot::inListElem:
++      if (isValueStart(type))
++      {
++        s.slot = Slot::inListSepOrClose;
++      }
++      break;
++
++    case Slot::inListSepOrClose:
++      if (type == StlTokenType::comma)
++      {
++        s.slot = Slot::inListElem;
++      }
++      else if (type == StlTokenType::rightParen)
++      {
++        s.slot = Slot::binaryOp;
++      }
++      break;
++
++    case Slot::done:
++      break;
++  }
++}
++
++/// Resolve the `SELECT`ed class by scanning until `FROM` (or end). Returns null when the
++/// class name is absent, multi-segment with unresolved parts, or not in the registry.
++[[nodiscard]] const ClassType* resolveSelectedClass(const std::vector<FsmToken>& tokens,
++                                                    const CustomTypeRegistry&    types)
++{
++  std::string qualifiedName;
++  bool        inSelect = false;
++  for (const auto& t: tokens)
++  {
++    if (!inSelect)
++    {
++      if (t.type == StlTokenType::keywordSelect)
++      {
++        inSelect = true;
++      }
++      continue;
++    }
++    if (t.type == StlTokenType::keywordFrom || t.type == StlTokenType::star)
++    {
++      break;
++    }
++    if (t.type == StlTokenType::identifier)
++    {
++      if (!qualifiedName.empty())
++      {
++        qualifiedName.push_back('.');
++      }
++      qualifiedName.append(t.lexeme);
++    }
++    else if (t.type != StlTokenType::dot)
++    {
++      break;
++    }
++  }
++  if (qualifiedName.empty())
++  {
++    return nullptr;
++  }
++  const auto handle = types.get(qualifiedName);
++  if (!handle.has_value())
++  {
++    return nullptr;
++  }
++  const auto classHandle = dynamicTypeHandleCast<const ClassType>(*handle);
++  if (!classHandle.has_value())
++  {
++    return nullptr;
++  }
++  return classHandle->type();
++}
++
++/// Prefix-filter helper. The language is case-sensitive (UPPER control keywords, lower
++/// `true`/`false`, case-preserving identifiers) so a plain substring compare is what
++/// editors want here.
++[[nodiscard]] bool startsWith(std::string_view candidate, std::string_view prefix) noexcept
++{
++  return candidate.size() >= prefix.size() && candidate.compare(0, prefix.size(), prefix) == 0;
++}
++
++/// Walk `AliasType` chains so enum/native detection works on aliased declarations.
++[[nodiscard]] const Type* unwrapAliases(const Type* type) noexcept
++{
++  while (type != nullptr && type->isAliasType())
++  {
++    const auto* alias = type->asAliasType();
++    type = alias->getAliasedType().type();
++  }
++  return type;
++}
++
++/// Helpers to push completion candidates with a prefix filter.
++void pushKeyword(std::vector<Completion>& out, std::string_view kw, std::string_view prefix)
++{
++  if (startsWith(kw, prefix))
++  {
++    out.push_back(KeywordCompletion {std::string {kw}});
++  }
++}
++
++/// Convenience overload: fetch the canonical lexeme from `lexemeOf` so call sites don't
++/// repeat the string literal. Useful for grammar keywords (SELECT, FROM, AND, ...) and
++/// for the `true` / `false` bool literals.
++void pushKeyword(std::vector<Completion>& out, StlTokenType type, std::string_view prefix)
++{
++  pushKeyword(out, lexemeOf(type), prefix);
++}
++
++void pushClassCandidates(std::vector<Completion>&  out,
++                         const CustomTypeRegistry& types,
++                         std::string_view          prefix)
++{
++  pushKeyword(out, "*", prefix);
++  for (const auto& [name, handle]: types.getAll())
++  {
++    const auto classHandle = dynamicTypeHandleCast<const ClassType>(handle);
++    if (!classHandle.has_value())
++    {
++      continue;
++    }
++    if (startsWith(name, prefix))
++    {
++      out.push_back(ClassNameCompletion {*classHandle});
++    }
++  }
++}
++
++void pushSessionCandidates(std::vector<Completion>& out, const BusLookup& buses, std::string_view prefix)
++{
++  if (!buses.sessions)
++  {
++    return;
++  }
++  const auto names = buses.sessions();
++  for (const auto& n: names)
++  {
++    if (startsWith(n, prefix))
++    {
++      out.push_back(SessionCompletion {n});
++    }
++  }
++}
++
++void pushBusCandidates(std::vector<Completion>& out,
++                       const BusLookup&         buses,
++                       std::string_view         session,
++                       std::string_view         prefix)
++{
++  if (!buses.buses || session.empty())
++  {
++    return;
++  }
++  const auto names = buses.buses(session);
++  for (const auto& n: names)
++  {
++    if (startsWith(n, prefix))
++    {
++      out.push_back(BusCompletion {std::string {session}, n});
++    }
++  }
++}
++
++void pushPropertyCandidates(std::vector<Completion>& out, const ClassType& cls, std::string_view prefix)
++{
++  const auto props = cls.getProperties(ClassType::SearchMode::includeParents);
++  for (const auto& p: props)
++  {
++    if (startsWith(p->getName(), prefix))
++    {
++      out.push_back(PropertyCompletion {p});
++    }
++  }
++}
++
++/// Emit typed-value suggestions for the LHS's type, if we can enumerate it. Enum values
++/// are quoted per the language spec; bool values are the lowercase keywords. Everything
++/// else returns no candidates.
++void pushTypedValueCandidates(std::vector<Completion>& out, const Property& prop, std::string_view prefix)
++{
++  const auto typeHandle = prop.getType();
++  const Type* effective = unwrapAliases(typeHandle.type());
++  if (effective == nullptr)
++  {
++    return;
++  }
++  if (effective->isBoolType())
++  {
++    for (const auto type: {StlTokenType::keywordTrue, StlTokenType::keywordFalse})
++    {
++      const auto v = lexemeOf(type);
++      if (startsWith(v, prefix))
++      {
++        out.push_back(TypedValueCompletion {std::string {v}, typeHandle});
++      }
++    }
++    return;
++  }
++  if (!effective->isEnumType())
++  {
++    return;
++  }
++  const auto* enumType = effective->asEnumType();
++  if (enumType == nullptr)
++  {
++    return;
++  }
++  // The value shape is a double-quoted string containing the enumerator name.
++  // If the caller is already mid-string, match against the inner name; otherwise
++  // match against the full quoted form.
++  const bool  insideString = !prefix.empty() && (prefix.front() == '"' || prefix.front() == '\'');
++  const char  quote = insideString ? prefix.front() : '"';
++  const auto  innerPrefix = insideString ? prefix.substr(1) : std::string_view {};
++  for (const auto& e: enumType->getEnums())
++  {
++    std::string literal;
++    literal.push_back(quote);
++    literal.append(e.name);
++    literal.push_back(quote);
++
++    const bool matches =
++      insideString ? startsWith(e.name, innerPrefix) : startsWith(literal, prefix);
++    if (matches)
++    {
++      out.push_back(TypedValueCompletion {std::move(literal), typeHandle});
++    }
++  }
++}
++
++}  // namespace
++
++CompleteResult complete(std::string_view          text,
++                        std::size_t               cursor,
++                        const CustomTypeRegistry& types,
++                        const BusLookup&          buses)
++{
++  if (cursor > text.size())
++  {
++    cursor = text.size();
++  }
++
++  const auto tokens = scan(text);
++  const auto currentIdx = findCurrentToken(tokens, cursor);
++
++  std::string prefix;
++  TextSpan    replacement {cursor, cursor};
++  if (currentIdx < tokens.size())
++  {
++    const auto& cur = tokens[currentIdx];
++    prefix = text.substr(cur.span.begin, cursor - cur.span.begin);
++    replacement = cur.span;
++  }
++
++  // Walk tokens strictly before the current token (or all of them, when cursor is between
++  // tokens). `cls` is resolved up-front so we can feed typed-value completion and property
++  // lists off it.
++  const ClassType* cls = resolveSelectedClass(tokens, types);
++  FsmState         state;
++  const std::size_t stopAt = (currentIdx < tokens.size()) ? currentIdx : tokens.size();
++  for (std::size_t i = 0U; i < stopAt; ++i)
++  {
++    step(state, tokens[i], cls);
++  }
++
++  // Class-path candidates are fully qualified (e.g. `demo.Aircraft`), but the source
++  // holds the path as `identifier . identifier . ...`. If the cursor sits after one of
++  // those dots, we widen the replacement to cover the whole accumulated path so the
++  // filter prefix matches against the candidate's qualified name.
++  if (state.slot == Slot::classPath)
++  {
++    std::size_t rbegin = stopAt;
++    while (rbegin >= 2U && tokens[rbegin - 1U].type == StlTokenType::dot &&
++           tokens[rbegin - 2U].type == StlTokenType::identifier)
++    {
++      rbegin -= 2U;
++    }
++    if (rbegin < stopAt)
++    {
++      const std::size_t begin = tokens[rbegin].span.begin;
++      const std::size_t end = (currentIdx < tokens.size()) ? tokens[currentIdx].span.end : cursor;
++      replacement = TextSpan {begin, end};
++      prefix = std::string {text.substr(begin, cursor - begin)};
++    }
++  }
++
++  CompleteResult result;
++  result.replacement = replacement;
++
++  switch (state.slot)
++  {
++    case Slot::selectKeyword:
++      pushKeyword(result.items, StlTokenType::keywordSelect, prefix);
++      break;
++
++    case Slot::classPath:
++      pushClassCandidates(result.items, types, prefix);
++      break;
++
++    case Slot::classPathTail:
++      pushKeyword(result.items, StlTokenType::keywordFrom, prefix);
++      break;
++
++    case Slot::fromKeyword:
++      pushKeyword(result.items, StlTokenType::keywordFrom, prefix);
++      break;
++
++    case Slot::sessionName:
++      pushSessionCandidates(result.items, buses, prefix);
++      break;
++
++    case Slot::busDot:
++      // Nothing useful to complete: user needs to type `.`. Leave empty.
++      break;
++
++    case Slot::busName:
++      pushBusCandidates(result.items, buses, state.sessionName, prefix);
++      break;
++
++    case Slot::whereOrEnd:
++      pushKeyword(result.items, StlTokenType::keywordWhere, prefix);
++      break;
++
++    case Slot::whereExpr:
++      if (cls != nullptr)
++      {
++        pushPropertyCandidates(result.items, *cls, prefix);
++      }
++      pushKeyword(result.items, StlTokenType::keywordNot, prefix);
++      pushKeyword(result.items, StlTokenType::keywordTrue, prefix);
++      pushKeyword(result.items, StlTokenType::keywordFalse, prefix);
++      break;
++
++    case Slot::binaryOp:
++      pushKeyword(result.items, StlTokenType::keywordAnd, prefix);
++      pushKeyword(result.items, StlTokenType::keywordOr, prefix);
++      pushKeyword(result.items, StlTokenType::keywordBetween, prefix);
++      pushKeyword(result.items, StlTokenType::keywordIn, prefix);
++      pushKeyword(result.items, StlTokenType::keywordNot, prefix);
++      break;
++
++    case Slot::literal:
++    case Slot::betweenFirst:
++    case Slot::betweenSecond:
++    case Slot::inListElem:
++      if (state.lhsProperty != nullptr)
++      {
++        pushTypedValueCandidates(result.items, *state.lhsProperty, prefix);
++      }
++      break;
++
++    case Slot::afterNotInExpr:
++      pushKeyword(result.items, StlTokenType::keywordBetween, prefix);
++      pushKeyword(result.items, StlTokenType::keywordIn, prefix);
++      break;
++
++    case Slot::betweenAnd:
++      pushKeyword(result.items, StlTokenType::keywordAnd, prefix);
++      break;
++
++    case Slot::inOpenParen:
++      // Nothing to complete; user needs `(`.
++      break;
++
++    case Slot::inListSepOrClose:
++      // Users rarely want punctuation completion; leave empty.
++      break;
++
++    case Slot::done:
++      break;
++  }
++
++  return result;
++}
++
++}  // namespace sen::lang::query
+diff --git a/libs/core/src/lang/query/tokenize.cpp b/libs/core/src/lang/query/tokenize.cpp
+index 2290611..57e7b83 100644
+--- a/libs/core/src/lang/query/tokenize.cpp
++++ b/libs/core/src/lang/query/tokenize.cpp
+@@ -132,16 +132,24 @@ TokenizeResult tokenize(std::string_view text)
+       ++cursor;
+     }
+ 
+-    const std::size_t end = raw.loc.offset;
++    std::size_t       end = raw.loc.offset;
+     const std::size_t begin = (cursor <= end) ? cursor : end;
+ 
++    // The scanner's `number()` consumes trailing whitespace (legacy support for
++    // `- 5` signed numerics). Trim it off so the reported span covers exactly the
++    // token characters.
++    while (end > begin && isWhitespace(source[end - 1U]))
++    {
++      --end;
++    }
++
+     Token tok;
+     tok.kind = classify(raw.type);
+     tok.span = TextSpan {begin, end};
+     tok.lexeme = (end > begin) ? source.substr(begin, end - begin) : std::string {};
+     result.tokens.push_back(std::move(tok));
+ 
+-    cursor = end;
++    cursor = raw.loc.offset;
+   }
+ 
+   return result;
+diff --git a/libs/core/src/lang/stl_scanner.cpp b/libs/core/src/lang/stl_scanner.cpp
+index 4be9f13..497ae06 100644
+--- a/libs/core/src/lang/stl_scanner.cpp
++++ b/libs/core/src/lang/stl_scanner.cpp
+@@ -253,72 +253,13 @@ char StlScanner::advance()
+ 
+ void StlScanner::addToken(StlTokenType type, const Var& value)
+ {
+-  using LexemeMap = std::unordered_map<StlTokenType, std::string>;
+-
+-  static LexemeMap lexemeMap = {{StlTokenType::keywordFalse, "false"},
+-                                {StlTokenType::keywordTrue, "true"},
+-                                {StlTokenType::keywordFunction, "fn"},
+-                                {StlTokenType::keywordEvent, "event"},
+-                                {StlTokenType::keywordVar, "var"},
+-                                {StlTokenType::keywordAbstract, "abstract"},
+-                                {StlTokenType::keywordClass, "class"},
+-                                {StlTokenType::keywordInterface, "interface"},
+-                                {StlTokenType::keywordExtends, "extends"},
+-                                {StlTokenType::keywordImplements, "implements"},
+-                                {StlTokenType::keywordStruct, "struct"},
+-                                {StlTokenType::keywordVariant, "variant"},
+-                                {StlTokenType::keywordImport, "import"},
+-                                {StlTokenType::keywordPackage, "package"},
+-                                {StlTokenType::keywordEnum, "enum"},
+-                                {StlTokenType::keywordSequence, "sequence"},
+-                                {StlTokenType::keywordArray, "array"},
+-                                {StlTokenType::keywordQuantity, "quantity"},
+-                                {StlTokenType::keywordAlias, "alias"},
+-                                {StlTokenType::keywordOptional, "optional"},
+-                                {StlTokenType::keywordAnd, "AND"},
+-                                {StlTokenType::keywordOr, "OR"},
+-                                {StlTokenType::keywordNot, "NOT"},
+-                                {StlTokenType::keywordSelect, "SELECT"},
+-                                {StlTokenType::keywordWhere, "WHERE"},
+-                                {StlTokenType::keywordFrom, "FROM"},
+-                                {StlTokenType::keywordIn, "IN"},
+-                                {StlTokenType::keywordBetween, "BETWEEN"},
+-                                {StlTokenType::leftParen, "("},
+-                                {StlTokenType::rightParen, ")"},
+-                                {StlTokenType::leftBrace, "{"},
+-                                {StlTokenType::rightBrace, "}"},
+-                                {StlTokenType::leftBracket, "["},
+-                                {StlTokenType::rightBracket, "]"},
+-                                {StlTokenType::comma, ","},
+-                                {StlTokenType::dot, "."},
+-                                {StlTokenType::colon, ":"},
+-                                {StlTokenType::semicolon, ";"},
+-                                {StlTokenType::minus, "-"},
+-                                {StlTokenType::plus, "+"},
+-                                {StlTokenType::star, "*"},
+-                                {StlTokenType::at, "@"},
+-                                {StlTokenType::slash, "/"},
+-                                {StlTokenType::bang, "!"},
+-                                {StlTokenType::bangEqual, "!="},
+-                                {StlTokenType::equal, "="},
+-                                {StlTokenType::equalEqual, "=="},
+-                                {StlTokenType::less, "<"},
+-                                {StlTokenType::lessEqual, "<="},
+-                                {StlTokenType::greater, ">"},
+-                                {StlTokenType::greaterEqual, ">="}};
+-
+-  const auto& lexeme = lexemeMap.find(type);
+-  if (lexeme == lexemeMap.end())
++  const std::string_view lexeme = lexemeOf(type);
++  if (lexeme.empty())
+   {
+-    std::string err;
+-    err = "unknown token type ";
+-    err.append("'");
+-    err.append(toString(type));
+-    err.append("'");
+-    throw std::logic_error(err);
++    throw std::logic_error("token type '" + toString(type) + "' has no fixed lexeme");
+   }
+ 
+-  tokens_.emplace_back(type, lexeme->second, value, current_);
++  tokens_.emplace_back(type, std::string {lexeme}, value, current_);
+ }
+ 
+ void StlScanner::error(const std::string& message)
+diff --git a/libs/core/src/lang/stl_token.cpp b/libs/core/src/lang/stl_token.cpp
+index 9110a31..eb9b7da 100644
+--- a/libs/core/src/lang/stl_token.cpp
++++ b/libs/core/src/lang/stl_token.cpp
+@@ -8,12 +8,14 @@
+ #include "sen/core/lang/stl_token.h"
+ 
+ // sen
++#include "sen/core/base/compiler_macros.h"
+ #include "sen/core/base/numbers.h"
+ #include "sen/core/meta/var.h"
+ 
+ // std
+ #include <cstdint>
+ #include <string>
++#include <string_view>
+ 
+ namespace sen::lang
+ {
+@@ -152,4 +154,125 @@ std::string toString(StlTokenType type)
+   return toString(token);
+ }
+ 
++std::string_view lexemeOf(StlTokenType type) noexcept
++{
++  switch (type)  // NOSONAR
++  {
++    case StlTokenType::leftParen:
++      return "(";
++    case StlTokenType::rightParen:
++      return ")";
++    case StlTokenType::leftBrace:
++      return "{";
++    case StlTokenType::rightBrace:
++      return "}";
++    case StlTokenType::leftBracket:
++      return "[";
++    case StlTokenType::rightBracket:
++      return "]";
++    case StlTokenType::comma:
++      return ",";
++    case StlTokenType::dot:
++      return ".";
++    case StlTokenType::minus:
++      return "-";
++    case StlTokenType::plus:
++      return "+";
++    case StlTokenType::colon:
++      return ":";
++    case StlTokenType::semicolon:
++      return ";";
++    case StlTokenType::slash:
++      return "/";
++    case StlTokenType::star:
++      return "*";
++    case StlTokenType::at:
++      return "@";
++    case StlTokenType::bang:
++      return "!";
++    case StlTokenType::bangEqual:
++      return "!=";
++    case StlTokenType::equal:
++      return "=";
++    case StlTokenType::equalEqual:
++      return "==";
++    case StlTokenType::greater:
++      return ">";
++    case StlTokenType::greaterEqual:
++      return ">=";
++    case StlTokenType::less:
++      return "<";
++    case StlTokenType::lessEqual:
++      return "<=";
++
++    case StlTokenType::keywordAbstract:
++      return "abstract";
++    case StlTokenType::keywordAnd:
++      return "AND";
++    case StlTokenType::keywordClass:
++      return "class";
++    case StlTokenType::keywordInterface:
++      return "interface";
++    case StlTokenType::keywordExtends:
++      return "extends";
++    case StlTokenType::keywordImplements:
++      return "implements";
++    case StlTokenType::keywordStruct:
++      return "struct";
++    case StlTokenType::keywordVariant:
++      return "variant";
++    case StlTokenType::keywordFalse:
++      return "false";
++    case StlTokenType::keywordFunction:
++      return "fn";
++    case StlTokenType::keywordEvent:
++      return "event";
++    case StlTokenType::keywordVar:
++      return "var";
++    case StlTokenType::keywordOr:
++      return "OR";
++    case StlTokenType::keywordNot:
++      return "NOT";
++    case StlTokenType::keywordTrue:
++      return "true";
++    case StlTokenType::keywordImport:
++      return "import";
++    case StlTokenType::keywordOptional:
++      return "optional";
++    case StlTokenType::keywordPackage:
++      return "package";
++    case StlTokenType::keywordEnum:
++      return "enum";
++    case StlTokenType::keywordSequence:
++      return "sequence";
++    case StlTokenType::keywordArray:
++      return "array";
++    case StlTokenType::keywordQuantity:
++      return "quantity";
++    case StlTokenType::keywordAlias:
++      return "alias";
++    case StlTokenType::keywordSelect:
++      return "SELECT";
++    case StlTokenType::keywordWhere:
++      return "WHERE";
++    case StlTokenType::keywordFrom:
++      return "FROM";
++    case StlTokenType::keywordIn:
++      return "IN";
++    case StlTokenType::keywordBetween:
++      return "BETWEEN";
++
++    case StlTokenType::identifier:
++    case StlTokenType::string:
++    case StlTokenType::real:
++    case StlTokenType::integral:
++    case StlTokenType::comment:
++    case StlTokenType::endOfFile:
++    case StlTokenType::invalidChar:
++    case StlTokenType::partialString:
++      return {};
++  }
++  SEN_UNREACHABLE();
++}
++
+ }  // namespace sen::lang
+diff --git a/libs/core/test/CMakeLists.txt b/libs/core/test/CMakeLists.txt
+index daf89be..7777109 100644
+--- a/libs/core/test/CMakeLists.txt
++++ b/libs/core/test/CMakeLists.txt
+@@ -62,8 +62,13 @@ set(io_tests
+     io/buffer_writer_test.cpp
+ )
+ 
+-set(lang_tests lang/parser_test.cpp lang/compiler_test.cpp lang/resolver_test.cpp lang/query/tokenize_test.cpp
+-               lang/query/validate_test.cpp
++set(lang_tests
++    lang/parser_test.cpp
++    lang/compiler_test.cpp
++    lang/resolver_test.cpp
++    lang/query/tokenize_test.cpp
++    lang/query/validate_test.cpp
++    lang/query/complete_test.cpp
+ )
+ 
+ set(obj_tests
+diff --git a/libs/core/test/lang/query/complete_test.cpp b/libs/core/test/lang/query/complete_test.cpp
+new file mode 100644
+index 0000000..55b5fe6
+--- /dev/null
++++ b/libs/core/test/lang/query/complete_test.cpp
+@@ -0,0 +1,410 @@
++// === complete_test.cpp ===============================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#include "sen/core/lang/query/complete.h"
++
++// sen
++#include "sen/core/lang/query/bus_lookup.h"
++#include "sen/core/meta/class_type.h"
++#include "sen/core/meta/enum_type.h"
++#include "sen/core/meta/native_types.h"
++#include "sen/core/meta/property.h"
++#include "sen/core/meta/type_registry.h"
++
++// gtest
++#include <gtest/gtest.h>
++
++// std
++#include <string>
++#include <vector>
++
++using sen::ClassSpec;
++using sen::ClassType;
++using sen::CustomTypeRegistry;
++using sen::Enumerator;
++using sen::EnumSpec;
++using sen::EnumType;
++using sen::PropertyCategory;
++using sen::PropertySpec;
++using sen::TransportMode;
++using sen::lang::query::BusCompletion;
++using sen::lang::query::BusLookup;
++using sen::lang::query::ClassNameCompletion;
++using sen::lang::query::Completion;
++using sen::lang::query::complete;
++using sen::lang::query::CompleteResult;
++using sen::lang::query::KeywordCompletion;
++using sen::lang::query::PropertyCompletion;
++using sen::lang::query::SessionCompletion;
++using sen::lang::query::TypedValueCompletion;
++
++namespace
++{
++
++// Aircraft class with mixed property kinds so we can exercise typed-value completion:
++// `force` is an enum, `active` is a bool, `altitude` is an integer, `callsign` is a string.
++EnumSpec forceEnumSpec()
++{
++  std::vector<Enumerator> enums {{"friendly", 0, ""}, {"neutral", 1, ""}, {"opposing", 2, ""}};
++  return EnumSpec {"ForceId", "demo.ForceId", "", std::move(enums), sen::UInt8Type::get()};
++}
++
++ClassSpec aircraftSpec(sen::ConstTypeHandle<EnumType> forceEnum)
++{
++  std::vector<PropertySpec> properties;
++  properties.emplace_back("callsign",
++                          "",
++                          sen::StringType::get(),
++                          PropertyCategory::dynamicRW,
++                          TransportMode::multicast,
++                          false,
++                          std::vector<std::string> {});
++  properties.emplace_back("altitude",
++                          "",
++                          sen::UInt32Type::get(),
++                          PropertyCategory::dynamicRW,
++                          TransportMode::multicast,
++                          false,
++                          std::vector<std::string> {});
++  properties.emplace_back("active",
++                          "",
++                          sen::BoolType::get(),
++                          PropertyCategory::dynamicRW,
++                          TransportMode::multicast,
++                          false,
++                          std::vector<std::string> {});
++  properties.emplace_back("force",
++                          "",
++                          std::move(forceEnum),
++                          PropertyCategory::dynamicRW,
++                          TransportMode::multicast,
++                          false,
++                          std::vector<std::string> {});
++  return ClassSpec {"Aircraft", "demo.Aircraft", "", std::move(properties), {}, {}, {}, {}, false, false, {}, {}};
++}
++
++const CustomTypeRegistry& registryWithAircraft()
++{
++  static const auto kForce = EnumType::make(forceEnumSpec());
++  static const auto kAircraft = ClassType::make(aircraftSpec(kForce));
++  static CustomTypeRegistry registry;
++  static const bool seeded = [&]()
++  {
++    registry.add(kForce);
++    registry.add(kAircraft);
++    return true;
++  }();
++  (void)seeded;
++  return registry;
++}
++
++BusLookup makeBusLookup(std::vector<std::string> sessions, std::vector<std::string> buses)
++{
++  BusLookup lookup;
++  lookup.sessions = [sessions = std::move(sessions)]() { return sessions; };
++  lookup.buses = [buses = std::move(buses)](std::string_view) { return buses; };
++  return lookup;
++}
++
++template <class T>
++bool anyItemIs(const CompleteResult& r)
++{
++  for (const auto& c: r.items)
++  {
++    if (std::holds_alternative<T>(c))
++    {
++      return true;
++    }
++  }
++  return false;
++}
++
++bool hasKeyword(const CompleteResult& r, std::string_view text)
++{
++  for (const auto& c: r.items)
++  {
++    if (const auto* k = std::get_if<KeywordCompletion>(&c); k != nullptr && k->text == text)
++    {
++      return true;
++    }
++  }
++  return false;
++}
++
++bool hasClassName(const CompleteResult& r, std::string_view name)
++{
++  for (const auto& c: r.items)
++  {
++    if (const auto* cn = std::get_if<ClassNameCompletion>(&c); cn != nullptr && cn->type->getQualifiedName() == name)
++    {
++      return true;
++    }
++  }
++  return false;
++}
++
++bool hasPropertyNamed(const CompleteResult& r, std::string_view name)
++{
++  for (const auto& c: r.items)
++  {
++    if (const auto* p = std::get_if<PropertyCompletion>(&c); p != nullptr && p->property->getName() == name)
++    {
++      return true;
++    }
++  }
++  return false;
++}
++
++bool hasTypedValue(const CompleteResult& r, std::string_view text)
++{
++  for (const auto& c: r.items)
++  {
++    if (const auto* v = std::get_if<TypedValueCompletion>(&c); v != nullptr && v->text == text)
++    {
++      return true;
++    }
++  }
++  return false;
++}
++
++bool hasSession(const CompleteResult& r, std::string_view name)
++{
++  for (const auto& c: r.items)
++  {
++    if (const auto* s = std::get_if<SessionCompletion>(&c); s != nullptr && s->name == name)
++    {
++      return true;
++    }
++  }
++  return false;
++}
++
++bool hasBus(const CompleteResult& r, std::string_view name)
++{
++  for (const auto& c: r.items)
++  {
++    if (const auto* b = std::get_if<BusCompletion>(&c); b != nullptr && b->name == name)
++    {
++      return true;
++    }
++  }
++  return false;
++}
++
++}  // namespace
++
++/// @test
++/// Empty input suggests the `SELECT` keyword at cursor 0.
++TEST(QueryComplete, emptyInputSuggestsSelect)
++{
++  const auto& registry = registryWithAircraft();
++  const auto  buses = makeBusLookup({}, {});
++
++  const CompleteResult r = complete("", 0U, registry, buses);
++
++  EXPECT_TRUE(hasKeyword(r, "SELECT"));
++}
++
++/// @test
++/// A partial prefix filters the keyword completions.
++TEST(QueryComplete, selectKeywordPrefixFilters)
++{
++  const auto& registry = registryWithAircraft();
++  const auto  buses = makeBusLookup({}, {});
++
++  const CompleteResult r = complete("SEL", 3U, registry, buses);
++
++  EXPECT_TRUE(hasKeyword(r, "SELECT"));
++  EXPECT_EQ(r.replacement.begin, 0U);
++  EXPECT_EQ(r.replacement.end, 3U);
++}
++
++/// @test
++/// After `SELECT `, the registry's classes surface as `ClassNameCompletion`.
++TEST(QueryComplete, afterSelectOffersClassNames)
++{
++  const auto& registry = registryWithAircraft();
++  const auto  buses = makeBusLookup({}, {});
++
++  const CompleteResult r = complete("SELECT ", 7U, registry, buses);
++
++  EXPECT_TRUE(hasClassName(r, "demo.Aircraft"));
++  EXPECT_TRUE(hasKeyword(r, "*"));
++}
++
++/// @test
++/// Cursor sitting after a dot in a class path widens the replacement to cover the whole
++/// path, so the qualified class name filters correctly.
++TEST(QueryComplete, classPathDotWidensReplacement)
++{
++  const auto& registry = registryWithAircraft();
++  const auto  buses = makeBusLookup({}, {});
++
++  const CompleteResult r = complete("SELECT demo.", 12U, registry, buses);
++
++  EXPECT_TRUE(hasClassName(r, "demo.Aircraft"));
++  EXPECT_EQ(r.replacement.begin, 7U);
++  EXPECT_EQ(r.replacement.end, 12U);
++}
++
++/// @test
++/// After a complete class name, the next keyword is `FROM`.
++TEST(QueryComplete, afterClassNameOffersFrom)
++{
++  const auto& registry = registryWithAircraft();
++  const auto  buses = makeBusLookup({}, {});
++
++  const CompleteResult r = complete("SELECT demo.Aircraft ", 21U, registry, buses);
++
++  EXPECT_TRUE(hasKeyword(r, "FROM"));
++}
++
++/// @test
++/// After `FROM `, session names are offered.
++TEST(QueryComplete, afterFromOffersSessions)
++{
++  const auto& registry = registryWithAircraft();
++  const auto  buses = makeBusLookup({"alpha", "beta"}, {});
++
++  const CompleteResult r = complete("SELECT demo.Aircraft FROM ", 26U, registry, buses);
++
++  EXPECT_TRUE(hasSession(r, "alpha"));
++  EXPECT_TRUE(hasSession(r, "beta"));
++}
++
++/// @test
++/// After `<session>.`, bus names for that session are offered.
++TEST(QueryComplete, afterSessionDotOffersBuses)
++{
++  const auto& registry = registryWithAircraft();
++  const auto  buses = makeBusLookup({"alpha"}, {"b1", "b2"});
++
++  const CompleteResult r = complete("SELECT demo.Aircraft FROM alpha.", 32U, registry, buses);
++
++  EXPECT_TRUE(hasBus(r, "b1"));
++  EXPECT_TRUE(hasBus(r, "b2"));
++}
++
++/// @test
++/// After `<session>.<bus> `, the next keyword is `WHERE`.
++TEST(QueryComplete, afterBusOffersWhere)
++{
++  const auto& registry = registryWithAircraft();
++  const auto  buses = makeBusLookup({"alpha"}, {"b1"});
++
++  const CompleteResult r = complete("SELECT demo.Aircraft FROM alpha.b1 ", 35U, registry, buses);
++
++  EXPECT_TRUE(hasKeyword(r, "WHERE"));
++}
++
++/// @test
++/// At the start of the WHERE expression on a known class, property names from the class
++/// and the `NOT` / `true` / `false` keywords are offered.
++TEST(QueryComplete, whereExprOffersPropertiesAndBoolKeywords)
++{
++  const auto& registry = registryWithAircraft();
++  const auto  buses = makeBusLookup({"alpha"}, {"b1"});
++
++  const CompleteResult r = complete("SELECT demo.Aircraft FROM alpha.b1 WHERE ", 41U, registry, buses);
++
++  EXPECT_TRUE(hasPropertyNamed(r, "altitude"));
++  EXPECT_TRUE(hasPropertyNamed(r, "callsign"));
++  EXPECT_TRUE(hasKeyword(r, "NOT"));
++  EXPECT_TRUE(hasKeyword(r, "true"));
++  EXPECT_TRUE(hasKeyword(r, "false"));
++}
++
++/// @test
++/// After a property identifier in the WHERE clause, we offer comparison-op / logical-op
++/// keywords. The op tokens themselves aren't in the suggestion list since they are
++/// operator tokens, not completion candidates.
++TEST(QueryComplete, afterPropertyOffersComparisonKeywords)
++{
++  const auto& registry = registryWithAircraft();
++  const auto  buses = makeBusLookup({"alpha"}, {"b1"});
++
++  const CompleteResult r = complete("SELECT demo.Aircraft FROM alpha.b1 WHERE altitude ", 50U, registry, buses);
++
++  EXPECT_TRUE(hasKeyword(r, "AND"));
++  EXPECT_TRUE(hasKeyword(r, "OR"));
++  EXPECT_TRUE(hasKeyword(r, "BETWEEN"));
++  EXPECT_TRUE(hasKeyword(r, "IN"));
++  EXPECT_TRUE(hasKeyword(r, "NOT"));
++}
++
++/// @test
++/// On the RHS of a comparison against an enum-valued property, enum values surface as
++/// `TypedValueCompletion`, each already quoted.
++TEST(QueryComplete, enumPropertyRhsOffersEnumValues)
++{
++  const auto& registry = registryWithAircraft();
++  const auto  buses = makeBusLookup({"alpha"}, {"b1"});
++
++  const CompleteResult r = complete("SELECT demo.Aircraft FROM alpha.b1 WHERE force = ", 49U, registry, buses);
++
++  EXPECT_TRUE(anyItemIs<TypedValueCompletion>(r));
++  EXPECT_TRUE(hasTypedValue(r, "\"friendly\""));
++  EXPECT_TRUE(hasTypedValue(r, "\"neutral\""));
++  EXPECT_TRUE(hasTypedValue(r, "\"opposing\""));
++}
++
++/// @test
++/// While the user is inside a partial string on the RHS of an enum comparison, enum
++/// values filter against the inner prefix and each candidate re-quotes the full form.
++TEST(QueryComplete, enumPropertyInsidePartialString)
++{
++  const auto& registry = registryWithAircraft();
++  const auto  buses = makeBusLookup({"alpha"}, {"b1"});
++
++  const CompleteResult r = complete("SELECT demo.Aircraft FROM alpha.b1 WHERE force = \"fri", 53U, registry, buses);
++
++  EXPECT_TRUE(hasTypedValue(r, "\"friendly\""));
++  EXPECT_FALSE(hasTypedValue(r, "\"neutral\""));
++  EXPECT_EQ(r.replacement.begin, 49U);
++}
++
++/// @test
++/// A bool property on the RHS of a comparison offers `true` / `false` as typed values.
++TEST(QueryComplete, boolPropertyRhsOffersTrueFalse)
++{
++  const auto& registry = registryWithAircraft();
++  const auto  buses = makeBusLookup({"alpha"}, {"b1"});
++
++  const CompleteResult r = complete("SELECT demo.Aircraft FROM alpha.b1 WHERE active = ", 50U, registry, buses);
++
++  EXPECT_TRUE(hasTypedValue(r, "true"));
++  EXPECT_TRUE(hasTypedValue(r, "false"));
++}
++
++/// @test
++/// After `BETWEEN <min>` the structural `AND` is the only useful candidate.
++TEST(QueryComplete, betweenOffersStructuralAnd)
++{
++  const auto& registry = registryWithAircraft();
++  const auto  buses = makeBusLookup({"alpha"}, {"b1"});
++
++  const CompleteResult r =
++    complete("SELECT demo.Aircraft FROM alpha.b1 WHERE altitude BETWEEN 0 ", 60U, registry, buses);
++
++  EXPECT_TRUE(hasKeyword(r, "AND"));
++  EXPECT_FALSE(hasKeyword(r, "OR"));
++  EXPECT_FALSE(hasKeyword(r, "BETWEEN"));
++}
++
++/// @test
++/// When the selected class isn't in the registry, property completion is skipped but the
++/// keyword options remain.
++TEST(QueryComplete, unknownClassInWhereSkipsPropertyCompletion)
++{
++  const auto& registry = registryWithAircraft();
++  const auto  buses = makeBusLookup({"alpha"}, {"b1"});
++
++  const CompleteResult r = complete("SELECT demo.Missing FROM alpha.b1 WHERE ", 40U, registry, buses);
++
++  EXPECT_FALSE(hasPropertyNamed(r, "altitude"));
++  EXPECT_TRUE(hasKeyword(r, "NOT"));
++}
+-- 
+2.51.0
+

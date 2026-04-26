@@ -1,0 +1,1255 @@
+From 8c9c1eb50c395bd81d1d711fb643cacd712c0a6e Mon Sep 17 00:00:00 2001
+From: Enrique Parodi Spalazzi <enrique.parodi@airbus.com>
+Date: Fri, 24 Apr 2026 00:17:50 +0200
+Subject: [PATCH 02/10] feat[core/lang]: add query::tokenize() and
+ query::validate()
+
+First two public APIs of the sen::lang::query namespace, built on top of
+the Stage 1 tolerant scanner and recoverable parser.
+
+- tokenize(text) returns a list of typed tokens (keyword, string,
+  number, operator, identifier, comment, error) with spans, suitable
+  for syntax highlighting. Runs on the same scanner as
+  validate/complete/guideAt so consumers share a single source of
+  truth.
+- validate(text, types, buses) returns a DiagnosticList. Errors cover
+  syntax, property missing on a known class, and literal-vs-property
+  type mismatch. Infos cover class not yet in the type registry and
+  session/bus not yet discovered; these auto-clear once the thing
+  shows up.
+
+BusLookup is a struct of std::function<...>s rather than a virtual
+interface so callers can bind any source of session/bus information.
+---
+ libs/core/CMakeLists.txt                      |   9 +
+ .../include/sen/core/lang/query/bus_lookup.h  |  44 +++
+ .../include/sen/core/lang/query/tokenize.h    |  68 ++++
+ .../include/sen/core/lang/query/validate.h    |  67 ++++
+ libs/core/src/lang/query/tokenize.cpp         | 150 ++++++++
+ libs/core/src/lang/query/validate.cpp         | 359 ++++++++++++++++++
+ libs/core/test/CMakeLists.txt                 |   4 +-
+ libs/core/test/lang/query/tokenize_test.cpp   | 203 ++++++++++
+ libs/core/test/lang/query/validate_test.cpp   | 215 +++++++++++
+ 9 files changed, 1118 insertions(+), 1 deletion(-)
+ create mode 100644 libs/core/include/sen/core/lang/query/bus_lookup.h
+ create mode 100644 libs/core/include/sen/core/lang/query/tokenize.h
+ create mode 100644 libs/core/include/sen/core/lang/query/validate.h
+ create mode 100644 libs/core/src/lang/query/tokenize.cpp
+ create mode 100644 libs/core/src/lang/query/validate.cpp
+ create mode 100644 libs/core/test/lang/query/tokenize_test.cpp
+ create mode 100644 libs/core/test/lang/query/validate_test.cpp
+
+diff --git a/libs/core/CMakeLists.txt b/libs/core/CMakeLists.txt
+index 5c3c073..8799379 100644
+--- a/libs/core/CMakeLists.txt
++++ b/libs/core/CMakeLists.txt
+@@ -213,6 +213,10 @@ set(lang_public_headers
+     include/sen/core/lang/fom_parser.h
+ )
+ 
++set(lang_query_public_headers include/sen/core/lang/query/bus_lookup.h include/sen/core/lang/query/tokenize.h
++                               include/sen/core/lang/query/validate.h
++)
++
+ set(lang_sources
+     src/lang/diagnostic.cpp
+     src/lang/error_reporter.cpp
+@@ -224,6 +228,8 @@ set(lang_sources
+     src/lang/fom_document_set.cpp
+     src/lang/fom_document_set.h
+     src/lang/fom_parser.cpp
++    src/lang/query/tokenize.cpp
++    src/lang/query/validate.cpp
+ )
+ 
+ # -------------------------------------------------------------------------------------------------------------
+@@ -247,6 +253,7 @@ add_library(
+   ${io_detail_headers}
+   ${io_sources}
+   ${lang_public_headers}
++  ${lang_query_public_headers}
+   ${lang_sources}
+ )
+ 
+@@ -299,6 +306,7 @@ source_group("io\\sources" FILES ${io_sources})
+ source_group("lang\\public headers" FILES ${lang_public_headers})
+ source_group("lang\\detail headers" FILES ${lang_detail_headers})
+ source_group("lang\\sources" FILES ${lang_sources})
++source_group("lang\\query\\public headers" FILES ${lang_query_public_headers})
+ 
+ # -------------------------------------------------------------------------------------------------------------
+ # install
+@@ -321,6 +329,7 @@ install(FILES ${io_detail_headers} DESTINATION libs/core/include/sen/core/io/det
+ 
+ install(FILES ${lang_public_headers} DESTINATION libs/core/include/sen/core/lang)
+ install(FILES ${lang_detail_headers} DESTINATION libs/core/include/sen/core/lang/detail)
++install(FILES ${lang_query_public_headers} DESTINATION libs/core/include/sen/core/lang/query)
+ 
+ sen_internal_install(core)
+ 
+diff --git a/libs/core/include/sen/core/lang/query/bus_lookup.h b/libs/core/include/sen/core/lang/query/bus_lookup.h
+new file mode 100644
+index 0000000..e9f8e1c
+--- /dev/null
++++ b/libs/core/include/sen/core/lang/query/bus_lookup.h
+@@ -0,0 +1,44 @@
++// === bus_lookup.h ====================================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#ifndef SEN_CORE_LANG_QUERY_BUS_LOOKUP_H
++#define SEN_CORE_LANG_QUERY_BUS_LOOKUP_H
++
++// std
++#include <functional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace sen::lang::query
++{
++
++/// \addtogroup lang
++/// @{
++
++/// Injection point for bus topology. Plain struct of `std::function` so the kernel side
++/// can satisfy it however it likes (direct kernel calls in prod, scripted lambdas in
++/// tests, cache-refreshed lookups in term). Scale is bounded in Sen deployments
++/// (~50 sessions, ~500 buses total), so linear enumeration of the returned vectors is
++/// fine; no `hasSession` / `hasBus` fast paths needed.
++struct BusLookup
++{
++  /// All sessions known right now. An empty vector means the caller has not discovered
++  /// any sessions yet (or has none); either way, any bus reference will be classified
++  /// as `validateUnknownSession`.
++  std::function<std::vector<std::string>()> sessions;
++
++  /// All buses in the given session. An empty vector means either the session is unknown
++  /// or it has no buses; the caller distinguishes by checking `sessions()` first.
++  std::function<std::vector<std::string>(std::string_view session)> buses;
++};
++
++/// @}
++
++}  // namespace sen::lang::query
++
++#endif  // SEN_CORE_LANG_QUERY_BUS_LOOKUP_H
+diff --git a/libs/core/include/sen/core/lang/query/tokenize.h b/libs/core/include/sen/core/lang/query/tokenize.h
+new file mode 100644
+index 0000000..cd2d0e8
+--- /dev/null
++++ b/libs/core/include/sen/core/lang/query/tokenize.h
+@@ -0,0 +1,68 @@
++// === tokenize.h ======================================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#ifndef SEN_CORE_LANG_QUERY_TOKENIZE_H
++#define SEN_CORE_LANG_QUERY_TOKENIZE_H
++
++// sen
++#include "sen/core/lang/code_location.h"
++#include "sen/core/lang/diagnostic.h"
++
++// std
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace sen::lang::query
++{
++
++/// \addtogroup lang
++/// @{
++
++/// Semantic classification of a token. Coarser than `StlTokenType`: editors map this to
++/// theme colors, LSP clients map it to `SemanticTokenType`. Any token surfaced here can be
++/// handed to a highlighter without further inspection.
++enum class TokenKind
++{
++  keyword,      /// SELECT, FROM, WHERE, AND, OR, BETWEEN, IN, NOT, TRUE, FALSE
++  identifier,   /// property paths, session names, bus names, class names
++  string,       /// quoted string literal
++  number,       /// integral or real literal
++  operator_,    /// = != < <= > >= + - * /
++  punctuation,  /// . , ( )
++  comment,      /// line comment
++  error,        /// `invalidChar` / `partialString` from the tolerant scanner
++  endOfFile,    /// synthetic terminator at text.size()
++};
++
++/// One classified lexeme with its byte-accurate span into the source.
++struct Token
++{
++  TokenKind   kind = TokenKind::endOfFile;
++  TextSpan    span = {};
++  std::string lexeme = {};  /// raw text as it appears in the source (includes quotes for strings)
++};
++
++/// Result of a tolerant tokenization. Never throws, always returns every byte of input
++/// as either a token or whitespace between two tokens.
++struct TokenizeResult
++{
++  std::vector<Token> tokens = {};
++  DiagnosticList     diagnostics = {};
++};
++
++/// Tokenize query text tolerantly. Unrecognized characters become `TokenKind::error` tokens
++/// (with a `scanInvalidChar` diagnostic); unterminated strings become `TokenKind::error`
++/// tokens (with a `scanUnterminatedString` diagnostic). The result always ends with a
++/// single `TokenKind::endOfFile` token whose span begins at `text.size()`.
++[[nodiscard]] TokenizeResult tokenize(std::string_view text);
++
++/// @}
++
++}  // namespace sen::lang::query
++
++#endif  // SEN_CORE_LANG_QUERY_TOKENIZE_H
+diff --git a/libs/core/include/sen/core/lang/query/validate.h b/libs/core/include/sen/core/lang/query/validate.h
+new file mode 100644
+index 0000000..b12efde
+--- /dev/null
++++ b/libs/core/include/sen/core/lang/query/validate.h
+@@ -0,0 +1,67 @@
++// === validate.h ======================================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#ifndef SEN_CORE_LANG_QUERY_VALIDATE_H
++#define SEN_CORE_LANG_QUERY_VALIDATE_H
++
++// sen
++#include "sen/core/lang/diagnostic.h"
++#include "sen/core/lang/query/bus_lookup.h"
++#include "sen/core/lang/stl_statement.h"
++
++// std
++#include <string_view>
++
++namespace sen
++{
++class CustomTypeRegistry;
++}
++
++namespace sen::lang::query
++{
++
++/// \addtogroup lang
++/// @{
++
++/// Outcome of a static check of a query string.
++///
++/// `diagnostics` contains one entry per problem surface (syntax, unknown class, unknown
++/// property on a known class, literal/property type mismatch, unknown session, unknown
++/// bus, ...). Severity mirrors the policy in the Stage 2 design:
++/// unknown-class / unknown-session / unknown-bus are `Severity::info` because they
++/// self-clear once the registry or the bus lookup catches up, and syntax /
++/// property-missing-on-known-class / literal-type-mismatch are `Severity::error`.
++///
++/// `ast` is whatever the tolerant parser managed to build. Even on a bad query it is
++/// populated with partial fragments (whatever the parser got through before it gave up),
++/// so downstream stages (`complete`, `guideAt`) can still reason over the pieces that
++/// were parsed.
++struct ValidateResult
++{
++  DiagnosticList diagnostics = {};
++  QueryStatement ast = {};
++};
++
++/// Full static check of a query string.
++///
++/// Drives the tolerant scanner + tolerant parser, then walks the partial AST against
++/// `types` (for the SELECTed class and its properties) and `buses` (for the FROM
++/// session.bus reference). The returned diagnostics are the concatenation of scanner
++/// diagnostics, parser diagnostics, and the validator's own semantic checks; no
++/// de-duplication is attempted (each stage owns its own codes).
++///
++/// Pure function. No caching: callers that need the 2-second class-handle recheck
++/// described in the Stage 2 design hold their own state.
++[[nodiscard]] ValidateResult validate(std::string_view           text,
++                                      const CustomTypeRegistry&  types,
++                                      const BusLookup&           buses);
++
++/// @}
++
++}  // namespace sen::lang::query
++
++#endif  // SEN_CORE_LANG_QUERY_VALIDATE_H
+diff --git a/libs/core/src/lang/query/tokenize.cpp b/libs/core/src/lang/query/tokenize.cpp
+new file mode 100644
+index 0000000..2290611
+--- /dev/null
++++ b/libs/core/src/lang/query/tokenize.cpp
+@@ -0,0 +1,150 @@
++// === tokenize.cpp ====================================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#include "sen/core/lang/query/tokenize.h"
++
++// sen
++#include "sen/core/base/compiler_macros.h"
++#include "sen/core/lang/stl_scanner.h"
++#include "sen/core/lang/stl_token.h"
++
++namespace sen::lang::query
++{
++
++namespace
++{
++
++[[nodiscard]] bool isWhitespace(char c) noexcept { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
++
++[[nodiscard]] TokenKind classify(StlTokenType type) noexcept
++{
++  switch (type)
++  {
++    case StlTokenType::leftParen:
++    case StlTokenType::rightParen:
++    case StlTokenType::comma:
++    case StlTokenType::dot:
++      return TokenKind::punctuation;
++
++    case StlTokenType::leftBrace:
++    case StlTokenType::rightBrace:
++    case StlTokenType::leftBracket:
++    case StlTokenType::rightBracket:
++    case StlTokenType::colon:
++    case StlTokenType::semicolon:
++    case StlTokenType::at:
++      return TokenKind::punctuation;
++
++    case StlTokenType::minus:
++    case StlTokenType::plus:
++    case StlTokenType::slash:
++    case StlTokenType::star:
++    case StlTokenType::bang:
++    case StlTokenType::bangEqual:
++    case StlTokenType::equal:
++    case StlTokenType::equalEqual:
++    case StlTokenType::greater:
++    case StlTokenType::greaterEqual:
++    case StlTokenType::less:
++    case StlTokenType::lessEqual:
++      return TokenKind::operator_;
++
++    case StlTokenType::identifier:
++      return TokenKind::identifier;
++
++    case StlTokenType::string:
++    case StlTokenType::partialString:
++      return TokenKind::string;
++
++    case StlTokenType::real:
++    case StlTokenType::integral:
++      return TokenKind::number;
++
++    case StlTokenType::keywordSelect:
++    case StlTokenType::keywordFrom:
++    case StlTokenType::keywordWhere:
++    case StlTokenType::keywordAnd:
++    case StlTokenType::keywordOr:
++    case StlTokenType::keywordNot:
++    case StlTokenType::keywordIn:
++    case StlTokenType::keywordBetween:
++    case StlTokenType::keywordTrue:
++    case StlTokenType::keywordFalse:
++      return TokenKind::keyword;
++
++    case StlTokenType::keywordAbstract:
++    case StlTokenType::keywordClass:
++    case StlTokenType::keywordInterface:
++    case StlTokenType::keywordExtends:
++    case StlTokenType::keywordImplements:
++    case StlTokenType::keywordStruct:
++    case StlTokenType::keywordVariant:
++    case StlTokenType::keywordFunction:
++    case StlTokenType::keywordEvent:
++    case StlTokenType::keywordVar:
++    case StlTokenType::keywordImport:
++    case StlTokenType::keywordOptional:
++    case StlTokenType::keywordPackage:
++    case StlTokenType::keywordEnum:
++    case StlTokenType::keywordSequence:
++    case StlTokenType::keywordArray:
++    case StlTokenType::keywordQuantity:
++    case StlTokenType::keywordAlias:
++      // STL-definition keywords are not part of the query language, but if one slips into
++      // query text we still surface it as a keyword: the parser will reject it, and
++      // treating it as an identifier would mis-color it.
++      return TokenKind::keyword;
++
++    case StlTokenType::comment:
++      return TokenKind::comment;
++
++    case StlTokenType::invalidChar:
++      return TokenKind::error;
++
++    case StlTokenType::endOfFile:
++      return TokenKind::endOfFile;
++  }
++  SEN_UNREACHABLE();
++}
++
++}  // namespace
++
++TokenizeResult tokenize(std::string_view text)
++{
++  // Own the text in a std::string because StlScanner's API needs a std::string reference.
++  const std::string source(text);
++  StlScanner       scanner(source, ScanMode::tolerant);
++  const auto&      rawTokens = scanner.scanTokens();
++
++  TokenizeResult result;
++  result.tokens.reserve(rawTokens.size());
++  result.diagnostics = scanner.diagnostics();
++
++  std::size_t cursor = 0U;
++  for (const auto& raw: rawTokens)
++  {
++    while (cursor < source.size() && isWhitespace(source[cursor]))
++    {
++      ++cursor;
++    }
++
++    const std::size_t end = raw.loc.offset;
++    const std::size_t begin = (cursor <= end) ? cursor : end;
++
++    Token tok;
++    tok.kind = classify(raw.type);
++    tok.span = TextSpan {begin, end};
++    tok.lexeme = (end > begin) ? source.substr(begin, end - begin) : std::string {};
++    result.tokens.push_back(std::move(tok));
++
++    cursor = end;
++  }
++
++  return result;
++}
++
++}  // namespace sen::lang::query
+diff --git a/libs/core/src/lang/query/validate.cpp b/libs/core/src/lang/query/validate.cpp
+new file mode 100644
+index 0000000..4c24aef
+--- /dev/null
++++ b/libs/core/src/lang/query/validate.cpp
+@@ -0,0 +1,359 @@
++// === validate.cpp ====================================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#include "sen/core/lang/query/validate.h"
++
++// sen
++#include "sen/core/lang/stl_parser.h"
++#include "sen/core/lang/stl_scanner.h"
++#include "sen/core/meta/alias_type.h"
++#include "sen/core/meta/class_type.h"
++#include "sen/core/meta/native_types.h"
++#include "sen/core/meta/property.h"
++#include "sen/core/meta/type.h"
++#include "sen/core/meta/type_registry.h"
++
++// std
++#include <algorithm>
++#include <memory>
++#include <string>
++#include <utility>
++
++namespace sen::lang::query
++{
++
++namespace
++{
++
++[[nodiscard]] TextSpan tokenSpan(const StlToken& t) noexcept
++{
++  const std::size_t begin = (t.loc.offset >= t.lexeme.size()) ? (t.loc.offset - t.lexeme.size()) : 0U;
++  return TextSpan {begin, t.loc.offset};
++}
++
++/// Walks AliasType chains so that callers compare against the underlying type.
++[[nodiscard]] const Type* unwrapAliases(const Type* type) noexcept
++{
++  while (type != nullptr && type->isAliasType())
++  {
++    const auto* alias = type->asAliasType();
++    type = alias->getAliasedType().type();
++  }
++  return type;
++}
++
++/// Best-effort literal-vs-property-type match.
++///
++/// Returns `true` when we know the pair is compatible, `false` when we know it's a
++/// mismatch. We only flag clear mismatches: ambiguous cases (quantities, enums,
++/// variants, optionals, sequences, structs) return `true` to stay conservative. The
++/// design-doc policy is "nothing for we genuinely can't evaluate".
++[[nodiscard]] bool literalMatchesPropertyType(StlTokenType literal, const Type& propType) noexcept
++{
++  const Type* effective = unwrapAliases(&propType);
++  if (effective == nullptr)
++  {
++    return true;
++  }
++
++  switch (literal)
++  {
++    case StlTokenType::string:
++    case StlTokenType::partialString:
++      return effective->isStringType();
++
++    case StlTokenType::integral:
++      return effective->isNumericType();
++
++    case StlTokenType::real:
++      return effective->isRealType();
++
++    case StlTokenType::keywordTrue:
++    case StlTokenType::keywordFalse:
++      return effective->isBoolType();
++
++    default:
++      return true;
++  }
++}
++
++/// Friendly short tag for a literal, used in type-mismatch messages.
++[[nodiscard]] const char* literalKindName(StlTokenType literal) noexcept
++{
++  switch (literal)
++  {
++    case StlTokenType::string:
++    case StlTokenType::partialString:
++      return "string";
++    case StlTokenType::integral:
++      return "integer";
++    case StlTokenType::real:
++      return "real";
++    case StlTokenType::keywordTrue:
++    case StlTokenType::keywordFalse:
++      return "boolean";
++    default:
++      return "literal";
++  }
++}
++
++class WhereWalker
++{
++public:
++  WhereWalker(const ClassType& cls, DiagnosticList& out) noexcept: class_(cls), out_(out) {}
++
++  void walk(const std::shared_ptr<StlExpr>& expr)
++  {
++    if (expr == nullptr)
++    {
++      return;
++    }
++    std::visit(*this, expr->value);
++  }
++
++  void operator()(const std::monostate&) const noexcept {}
++
++  void operator()(const StlLiteralExpr&) const noexcept {}
++
++  void operator()(const StlVariableExpr& expr) { visitVariable(expr, nullptr); }
++
++  void operator()(const StlUnaryExpr& expr) { walk(expr.expr); }
++
++  void operator()(const StlGroupingExpr& expr) { walk(expr.expr); }
++
++  void operator()(const StlLogicalExpr& expr)
++  {
++    walk(expr.lhs);
++    walk(expr.rhs);
++  }
++
++  void operator()(const StlBinaryExpr& expr)
++  {
++    // For `<property> <op> <literal>` check the literal's type against the property's.
++    checkComparison(expr.lhs, expr.rhs);
++    checkComparison(expr.rhs, expr.lhs);
++
++    // Also walk sides generically so variable references on both sides get resolved.
++    walk(expr.lhs);
++    walk(expr.rhs);
++  }
++
++  void operator()(const StlBetweenExpr& expr)
++  {
++    checkComparison(expr.lhs, expr.min);
++    checkComparison(expr.lhs, expr.max);
++    walk(expr.lhs);
++    walk(expr.min);
++    walk(expr.max);
++  }
++
++  void operator()(const StlInExpr& expr)
++  {
++    for (const auto& elem: expr.set)
++    {
++      checkComparison(expr.lhs, elem);
++    }
++    walk(expr.lhs);
++    for (const auto& elem: expr.set)
++    {
++      walk(elem);
++    }
++  }
++
++private:
++  /// If `varSide` is a single-segment variable and `litSide` is a literal, flag the pair
++  /// when the literal's kind clearly doesn't match the property's type.
++  void checkComparison(const std::shared_ptr<StlExpr>& varSide, const std::shared_ptr<StlExpr>& litSide)
++  {
++    if (varSide == nullptr || litSide == nullptr)
++    {
++      return;
++    }
++    const auto* variable = std::get_if<StlVariableExpr>(&varSide->value);
++    const auto* literal = std::get_if<StlLiteralExpr>(&litSide->value);
++    if (variable == nullptr || literal == nullptr)
++    {
++      return;
++    }
++    const Property* prop = nullptr;
++    visitVariable(*variable, &prop);
++    if (prop == nullptr)
++    {
++      return;
++    }
++    const auto typeHandle = prop->getType();
++    if (typeHandle.type() == nullptr)
++    {
++      return;
++    }
++    if (literalMatchesPropertyType(literal->value.type, *typeHandle.type()))
++    {
++      return;
++    }
++    std::string msg;
++    msg.append("Property '");
++    msg.append(std::string {prop->getName()});
++    msg.append("' is of type '");
++    msg.append(std::string {typeHandle.type()->getName()});
++    msg.append("', cannot compare with ");
++    msg.append(literalKindName(literal->value.type));
++    msg.append(" literal");
++    out_.push_back(Diagnostic {litSide->span, Severity::error, DiagnosticCode::validateTypeMismatch, std::move(msg)});
++  }
++
++  /// Resolves a single-segment variable reference against the class. Multi-segment paths
++  /// (struct field access) are out of scope for Stage 2 commit 3 and are skipped. If
++  /// `propOut` is non-null, writes the resolved property pointer there (or leaves it
++  /// alone when unresolved / multi-segment).
++  void visitVariable(const StlVariableExpr& expr, const Property** propOut)
++  {
++    if (expr.path.size() != 1U)
++    {
++      return;
++    }
++    const auto& token = expr.path.front();
++    const Property* prop = class_.searchPropertyByName(token.lexeme);
++    if (prop == nullptr)
++    {
++      // Only emit the diagnostic once per variable node. When `propOut` is given, this is
++      // a "look up for type-match" call driven by `checkComparison` and the caller will
++      // walk the variable separately, producing the diagnostic from the other path. We
++      // only emit when called in the standalone `operator()(StlVariableExpr)` path (no
++      // `propOut`).
++      if (propOut == nullptr)
++      {
++        std::string msg;
++        msg.append("Property '");
++        msg.append(token.lexeme);
++        msg.append("' is not a property of class '");
++        msg.append(std::string {class_.getQualifiedName()});
++        msg.append("'");
++        out_.push_back(Diagnostic {tokenSpan(token),
++                                   Severity::error,
++                                   DiagnosticCode::validateUnknownProperty,
++                                   std::move(msg)});
++      }
++      return;
++    }
++    if (propOut != nullptr)
++    {
++      *propOut = prop;
++    }
++  }
++
++  const ClassType& class_;
++  DiagnosticList&  out_;
++};
++
++void validateBus(const BusNameStatement& bus, const BusLookup& lookup, DiagnosticList& out)
++{
++  if (bus.session.lexeme.empty())
++  {
++    return;
++  }
++  const auto sessions = lookup.sessions ? lookup.sessions() : std::vector<std::string> {};
++  const bool sessionKnown = std::find(sessions.begin(), sessions.end(), bus.session.lexeme) != sessions.end();
++  if (!sessionKnown)
++  {
++    std::string msg;
++    msg.append("Session '");
++    msg.append(bus.session.lexeme);
++    msg.append("' is not known yet");
++    out.push_back(Diagnostic {tokenSpan(bus.session),
++                              Severity::info,
++                              DiagnosticCode::validateUnknownSession,
++                              std::move(msg)});
++    return;
++  }
++  if (bus.bus.lexeme.empty())
++  {
++    return;
++  }
++  const auto busesInSession =
++    lookup.buses ? lookup.buses(std::string_view {bus.session.lexeme}) : std::vector<std::string> {};
++  const bool busKnown = std::find(busesInSession.begin(), busesInSession.end(), bus.bus.lexeme) != busesInSession.end();
++  if (!busKnown)
++  {
++    std::string msg;
++    msg.append("Bus '");
++    msg.append(bus.bus.lexeme);
++    msg.append("' is not known in session '");
++    msg.append(bus.session.lexeme);
++    msg.append("'");
++    out.push_back(
++      Diagnostic {tokenSpan(bus.bus), Severity::info, DiagnosticCode::validateUnknownBus, std::move(msg)});
++  }
++}
++
++}  // namespace
++
++ValidateResult validate(std::string_view text, const CustomTypeRegistry& types, const BusLookup& buses)
++{
++  const std::string source(text);
++
++  StlScanner  scanner(source, ScanMode::tolerant);
++  const auto& rawTokens = scanner.scanTokens();
++  auto        scannerDiagnostics = scanner.diagnostics();
++
++  StlParser parser(rawTokens);
++  auto      parsed = parser.parseQueryTolerant(std::move(scannerDiagnostics));
++
++  ValidateResult result;
++  result.diagnostics = std::move(parsed.diagnostics);
++  result.ast = std::move(parsed.query);
++
++  // Resolve the class if a type was parsed.
++  const ClassType* classType = nullptr;
++  if (result.ast.type.has_value() && !result.ast.type->qualifiedName.empty())
++  {
++    const auto typeHandle = types.get(result.ast.type->qualifiedName);
++    if (!typeHandle.has_value())
++    {
++      std::string msg;
++      msg.append("Class '");
++      msg.append(result.ast.type->qualifiedName);
++      msg.append("' is not known yet");
++      result.diagnostics.push_back(Diagnostic {result.ast.type->span,
++                                               Severity::info,
++                                               DiagnosticCode::validateUnknownClass,
++                                               std::move(msg)});
++    }
++    else
++    {
++      const auto classHandle = dynamicTypeHandleCast<const ClassType>(*typeHandle);
++      if (!classHandle.has_value())
++      {
++        std::string msg;
++        msg.append("'");
++        msg.append(result.ast.type->qualifiedName);
++        msg.append("' is not a class");
++        result.diagnostics.push_back(Diagnostic {result.ast.type->span,
++                                                 Severity::info,
++                                                 DiagnosticCode::validateUnknownClass,
++                                                 std::move(msg)});
++      }
++      else
++      {
++        classType = classHandle->type();
++      }
++    }
++  }
++
++  // Walk the WHERE expression against the resolved class.
++  if (classType != nullptr && result.ast.condition != nullptr)
++  {
++    WhereWalker walker(*classType, result.diagnostics);
++    walker.walk(result.ast.condition);
++  }
++
++  // Check the bus reference.
++  validateBus(result.ast.bus, buses, result.diagnostics);
++
++  return result;
++}
++
++}  // namespace sen::lang::query
+diff --git a/libs/core/test/CMakeLists.txt b/libs/core/test/CMakeLists.txt
+index ca2a26a..daf89be 100644
+--- a/libs/core/test/CMakeLists.txt
++++ b/libs/core/test/CMakeLists.txt
+@@ -62,7 +62,9 @@ set(io_tests
+     io/buffer_writer_test.cpp
+ )
+ 
+-set(lang_tests lang/parser_test.cpp lang/compiler_test.cpp lang/resolver_test.cpp)
++set(lang_tests lang/parser_test.cpp lang/compiler_test.cpp lang/resolver_test.cpp lang/query/tokenize_test.cpp
++               lang/query/validate_test.cpp
++)
+ 
+ set(obj_tests
+     obj/callback_test.cpp
+diff --git a/libs/core/test/lang/query/tokenize_test.cpp b/libs/core/test/lang/query/tokenize_test.cpp
+new file mode 100644
+index 0000000..bec9e23
+--- /dev/null
++++ b/libs/core/test/lang/query/tokenize_test.cpp
+@@ -0,0 +1,203 @@
++// === tokenize_test.cpp ===============================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#include "sen/core/lang/query/tokenize.h"
++
++// gtest
++#include <gtest/gtest.h>
++
++// std
++#include <string>
++#include <string_view>
++
++using sen::lang::DiagnosticCode;
++using sen::lang::Severity;
++using sen::lang::query::Token;
++using sen::lang::query::TokenizeResult;
++using sen::lang::query::TokenKind;
++using sen::lang::query::tokenize;
++
++namespace
++{
++
++[[nodiscard]] std::string sliceOf(std::string_view source, const Token& tok)
++{
++  return std::string {source.substr(tok.span.begin, tok.span.end - tok.span.begin)};
++}
++
++}  // namespace
++
++/// @test
++/// Every non-EOF token's span, taken from the source, equals the token's lexeme.
++TEST(QueryTokenize, spansCoverLexemes)
++{
++  const std::string_view source = "SELECT a.b FROM se.env WHERE a > 1";
++  const TokenizeResult   r = tokenize(source);
++
++  ASSERT_FALSE(r.tokens.empty());
++  EXPECT_EQ(r.tokens.back().kind, TokenKind::endOfFile);
++
++  for (const auto& tok: r.tokens)
++  {
++    if (tok.kind == TokenKind::endOfFile)
++    {
++      EXPECT_EQ(tok.span.begin, source.size());
++      EXPECT_EQ(tok.span.end, source.size());
++      continue;
++    }
++    EXPECT_LE(tok.span.begin, tok.span.end);
++    EXPECT_LE(tok.span.end, source.size());
++    EXPECT_EQ(sliceOf(source, tok), tok.lexeme);
++  }
++}
++
++/// @test
++/// Token kinds cover keyword, identifier, operator, punctuation, number in a typical query.
++TEST(QueryTokenize, kindCoverage)
++{
++  const std::string_view source = "SELECT altitude FROM s.b WHERE altitude > 1000";
++  const TokenizeResult   r = tokenize(source);
++
++  ASSERT_TRUE(r.diagnostics.empty());
++
++  bool sawKeyword = false;
++  bool sawIdent = false;
++  bool sawOp = false;
++  bool sawPunct = false;
++  bool sawNumber = false;
++  for (const auto& tok: r.tokens)
++  {
++    sawKeyword = sawKeyword || tok.kind == TokenKind::keyword;
++    sawIdent = sawIdent || tok.kind == TokenKind::identifier;
++    sawOp = sawOp || tok.kind == TokenKind::operator_;
++    sawPunct = sawPunct || tok.kind == TokenKind::punctuation;
++    sawNumber = sawNumber || tok.kind == TokenKind::number;
++  }
++  EXPECT_TRUE(sawKeyword);
++  EXPECT_TRUE(sawIdent);
++  EXPECT_TRUE(sawOp);
++  EXPECT_TRUE(sawPunct);
++  EXPECT_TRUE(sawNumber);
++}
++
++/// @test
++/// A double-quoted string literal is surfaced with quotes included in the span/lexeme.
++TEST(QueryTokenize, stringLexemeIncludesQuotes)
++{
++  const std::string_view source = "SELECT a FROM s.b WHERE n = \"hello\"";
++  const TokenizeResult   r = tokenize(source);
++
++  ASSERT_TRUE(r.diagnostics.empty());
++
++  bool found = false;
++  for (const auto& tok: r.tokens)
++  {
++    if (tok.kind == TokenKind::string)
++    {
++      EXPECT_EQ(tok.lexeme, "\"hello\"");
++      EXPECT_EQ(sliceOf(source, tok), "\"hello\"");
++      found = true;
++    }
++  }
++  EXPECT_TRUE(found);
++}
++
++/// @test
++/// Unterminated strings surface as error tokens and a `scanUnterminatedString` diagnostic.
++TEST(QueryTokenize, unterminatedStringProducesErrorTokenAndDiagnostic)
++{
++  const std::string_view source = "SELECT a FROM s.b WHERE n = \"oops";
++  const TokenizeResult   r = tokenize(source);
++
++  ASSERT_EQ(r.diagnostics.size(), 1U);
++  EXPECT_EQ(r.diagnostics.front().code, DiagnosticCode::scanUnterminatedString);
++  EXPECT_EQ(r.diagnostics.front().severity, Severity::error);
++
++  bool sawStringErrorToken = false;
++  for (const auto& tok: r.tokens)
++  {
++    if (tok.kind == TokenKind::string && tok.span.end == source.size())
++    {
++      sawStringErrorToken = true;
++    }
++  }
++  EXPECT_TRUE(sawStringErrorToken);
++}
++
++/// @test
++/// Invalid characters surface as error tokens and a `scanInvalidChar` diagnostic.
++TEST(QueryTokenize, invalidCharProducesErrorTokenAndDiagnostic)
++{
++  const std::string_view source = "SELECT a FROM s.b WHERE a # 1";
++  const TokenizeResult   r = tokenize(source);
++
++  ASSERT_FALSE(r.diagnostics.empty());
++  bool sawInvalid = false;
++  for (const auto& d: r.diagnostics)
++  {
++    if (d.code == DiagnosticCode::scanInvalidChar)
++    {
++      sawInvalid = true;
++    }
++  }
++  EXPECT_TRUE(sawInvalid);
++
++  bool sawErrorToken = false;
++  for (const auto& tok: r.tokens)
++  {
++    if (tok.kind == TokenKind::error && tok.lexeme == "#")
++    {
++      sawErrorToken = true;
++    }
++  }
++  EXPECT_TRUE(sawErrorToken);
++}
++
++/// @test
++/// Empty input produces a single endOfFile token at offset 0 and no diagnostics.
++TEST(QueryTokenize, emptyInput)
++{
++  const TokenizeResult r = tokenize("");
++
++  ASSERT_EQ(r.tokens.size(), 1U);
++  EXPECT_EQ(r.tokens.front().kind, TokenKind::endOfFile);
++  EXPECT_EQ(r.tokens.front().span.begin, 0U);
++  EXPECT_EQ(r.tokens.front().span.end, 0U);
++  EXPECT_TRUE(r.diagnostics.empty());
++}
++
++/// @test
++/// Whitespace-only input produces a single endOfFile token and no diagnostics.
++TEST(QueryTokenize, whitespaceOnly)
++{
++  const std::string_view source = "   \t\n  ";
++  const TokenizeResult   r = tokenize(source);
++
++  ASSERT_EQ(r.tokens.size(), 1U);
++  EXPECT_EQ(r.tokens.front().kind, TokenKind::endOfFile);
++  EXPECT_EQ(r.tokens.front().span.begin, source.size());
++  EXPECT_TRUE(r.diagnostics.empty());
++}
++
++/// @test
++/// Line comments are surfaced as TokenKind::comment with quotes in the lexeme.
++TEST(QueryTokenize, commentsSurfaceAsCommentKind)
++{
++  const std::string_view source = "SELECT a // trailing comment";
++  const TokenizeResult   r = tokenize(source);
++
++  ASSERT_TRUE(r.diagnostics.empty());
++  bool sawComment = false;
++  for (const auto& tok: r.tokens)
++  {
++    if (tok.kind == TokenKind::comment)
++    {
++      sawComment = true;
++    }
++  }
++  EXPECT_TRUE(sawComment);
++}
+diff --git a/libs/core/test/lang/query/validate_test.cpp b/libs/core/test/lang/query/validate_test.cpp
+new file mode 100644
+index 0000000..b880ca3
+--- /dev/null
++++ b/libs/core/test/lang/query/validate_test.cpp
+@@ -0,0 +1,215 @@
++// === validate_test.cpp ===============================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#include "sen/core/lang/query/validate.h"
++
++// sen
++#include "sen/core/lang/query/bus_lookup.h"
++#include "sen/core/meta/class_type.h"
++#include "sen/core/meta/native_types.h"
++#include "sen/core/meta/property.h"
++#include "sen/core/meta/type_registry.h"
++
++// gtest
++#include <gtest/gtest.h>
++
++// std
++#include <string>
++#include <vector>
++
++using sen::ClassSpec;
++using sen::ClassType;
++using sen::CustomTypeRegistry;
++using sen::PropertyCategory;
++using sen::PropertySpec;
++using sen::TransportMode;
++using sen::lang::DiagnosticCode;
++using sen::lang::DiagnosticList;
++using sen::lang::Severity;
++using sen::lang::query::BusLookup;
++using sen::lang::query::validate;
++using sen::lang::query::ValidateResult;
++
++namespace
++{
++
++// Shared class fixture used across the validate tests. Properties are chosen to exercise
++// every literal-type kind: string, integral, bool.
++ClassSpec aircraftSpec()
++{
++  std::vector<PropertySpec> properties;
++  properties.emplace_back("callsign",
++                          "",
++                          sen::StringType::get(),
++                          PropertyCategory::dynamicRW,
++                          TransportMode::multicast,
++                          false,
++                          std::vector<std::string> {});
++  properties.emplace_back("altitude",
++                          "",
++                          sen::UInt32Type::get(),
++                          PropertyCategory::dynamicRW,
++                          TransportMode::multicast,
++                          false,
++                          std::vector<std::string> {});
++  properties.emplace_back("active",
++                          "",
++                          sen::BoolType::get(),
++                          PropertyCategory::dynamicRW,
++                          TransportMode::multicast,
++                          false,
++                          std::vector<std::string> {});
++  return ClassSpec {"Aircraft", "demo.Aircraft", "", std::move(properties), {}, {}, {}, {}, false, false, {}, {}};
++}
++
++// Registers `demo.Aircraft` and pins the class handle in a static so the registry's
++// weak references stay resolvable across test invocations.
++const CustomTypeRegistry& registryWithAircraft()
++{
++  static const auto kAircraft = ClassType::make(aircraftSpec());
++  static CustomTypeRegistry registry;
++  static const bool seeded = [&]()
++  {
++    registry.add(kAircraft);
++    return true;
++  }();
++  (void)seeded;
++  return registry;
++}
++
++BusLookup makeBusLookup(std::vector<std::string> sessions, std::vector<std::string> buses)
++{
++  BusLookup lookup;
++  lookup.sessions = [sessions = std::move(sessions)]() { return sessions; };
++  lookup.buses = [buses = std::move(buses)](std::string_view) { return buses; };
++  return lookup;
++}
++
++bool hasDiagnosticWith(const DiagnosticList& diags, DiagnosticCode code, Severity severity)
++{
++  for (const auto& d: diags)
++  {
++    if (d.code == code && d.severity == severity)
++    {
++      return true;
++    }
++  }
++  return false;
++}
++
++}  // namespace
++
++/// @test
++/// A fully known query (class + property + session + bus) produces no diagnostics.
++TEST(QueryValidate, cleanQueryProducesNoDiagnostics)
++{
++  const auto& registry = registryWithAircraft();
++  const auto  buses = makeBusLookup({"s"}, {"b"});
++
++  const ValidateResult r = validate("SELECT demo.Aircraft FROM s.b WHERE altitude > 100", registry, buses);
++
++  EXPECT_TRUE(r.diagnostics.empty()) << "got " << r.diagnostics.size() << " unexpected diagnostics";
++}
++
++/// @test
++/// An unknown class produces a single info diagnostic with code `validateUnknownClass`.
++TEST(QueryValidate, unknownClassIsInfo)
++{
++  const auto& registry = registryWithAircraft();
++  const auto  buses = makeBusLookup({"s"}, {"b"});
++
++  const ValidateResult r = validate("SELECT demo.Missing FROM s.b WHERE 1 = 1", registry, buses);
++
++  EXPECT_TRUE(hasDiagnosticWith(r.diagnostics, DiagnosticCode::validateUnknownClass, Severity::info));
++}
++
++/// @test
++/// A known class with an unknown property produces an error with code `validateUnknownProperty`.
++TEST(QueryValidate, unknownPropertyOnKnownClassIsError)
++{
++  const auto& registry = registryWithAircraft();
++  const auto  buses = makeBusLookup({"s"}, {"b"});
++
++  const ValidateResult r = validate("SELECT demo.Aircraft FROM s.b WHERE speed > 100", registry, buses);
++
++  EXPECT_TRUE(hasDiagnosticWith(r.diagnostics, DiagnosticCode::validateUnknownProperty, Severity::error));
++}
++
++/// @test
++/// A known class, known property, mismatching literal type yields `validateTypeMismatch`.
++TEST(QueryValidate, literalTypeMismatchIsError)
++{
++  const auto& registry = registryWithAircraft();
++  const auto  buses = makeBusLookup({"s"}, {"b"});
++
++  // `altitude` is UInt32; comparing with a string literal is a mismatch.
++  const ValidateResult r = validate("SELECT demo.Aircraft FROM s.b WHERE altitude = \"hi\"", registry, buses);
++
++  EXPECT_TRUE(hasDiagnosticWith(r.diagnostics, DiagnosticCode::validateTypeMismatch, Severity::error));
++}
++
++/// @test
++/// A string literal matches a StringType property (no type-mismatch).
++TEST(QueryValidate, stringLiteralMatchesStringProperty)
++{
++  const auto& registry = registryWithAircraft();
++  const auto  buses = makeBusLookup({"s"}, {"b"});
++
++  const ValidateResult r = validate("SELECT demo.Aircraft FROM s.b WHERE callsign = \"AFR123\"", registry, buses);
++
++  EXPECT_FALSE(hasDiagnosticWith(r.diagnostics, DiagnosticCode::validateTypeMismatch, Severity::error));
++}
++
++/// @test
++/// An unknown session produces a single info diagnostic with code `validateUnknownSession`.
++TEST(QueryValidate, unknownSessionIsInfo)
++{
++  const auto& registry = registryWithAircraft();
++  const auto  buses = makeBusLookup({"other"}, {"b"});
++
++  const ValidateResult r = validate("SELECT demo.Aircraft FROM missing.b WHERE altitude > 0", registry, buses);
++
++  EXPECT_TRUE(hasDiagnosticWith(r.diagnostics, DiagnosticCode::validateUnknownSession, Severity::info));
++}
++
++/// @test
++/// A known session with an unknown bus produces `validateUnknownBus` at info.
++TEST(QueryValidate, knownSessionUnknownBusIsInfo)
++{
++  const auto& registry = registryWithAircraft();
++  const auto  buses = makeBusLookup({"s"}, {"only-this-one"});
++
++  const ValidateResult r = validate("SELECT demo.Aircraft FROM s.nope WHERE altitude > 0", registry, buses);
++
++  EXPECT_TRUE(hasDiagnosticWith(r.diagnostics, DiagnosticCode::validateUnknownBus, Severity::info));
++  EXPECT_FALSE(hasDiagnosticWith(r.diagnostics, DiagnosticCode::validateUnknownSession, Severity::info));
++}
++
++/// @test
++/// Syntax errors forward through the validate call with parser codes.
++TEST(QueryValidate, parserDiagnosticsForward)
++{
++  const auto& registry = registryWithAircraft();
++  const auto  buses = makeBusLookup({"s"}, {"b"});
++
++  const ValidateResult r = validate("SELECT FROM s.b WHERE altitude > 0", registry, buses);
++
++  EXPECT_TRUE(hasDiagnosticWith(r.diagnostics, DiagnosticCode::parseSyntax, Severity::error));
++}
++
++/// @test
++/// A known class / property / session / bus with a real literal on an integral property
++/// currently surfaces as a type mismatch (reals don't downcast to integers in this pass).
++TEST(QueryValidate, realLiteralOnIntegralPropertyIsMismatch)
++{
++  const auto& registry = registryWithAircraft();
++  const auto  buses = makeBusLookup({"s"}, {"b"});
++
++  const ValidateResult r = validate("SELECT demo.Aircraft FROM s.b WHERE altitude = 1.5", registry, buses);
++
++  EXPECT_TRUE(hasDiagnosticWith(r.diagnostics, DiagnosticCode::validateTypeMismatch, Severity::error));
++}
+-- 
+2.51.0
+

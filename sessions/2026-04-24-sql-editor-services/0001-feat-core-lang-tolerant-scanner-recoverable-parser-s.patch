@@ -1,0 +1,1702 @@
+From 3f8ab8c4f2660eaab3e3a03b1cd219cbe0b10dac Mon Sep 17 00:00:00 2001
+From: Enrique Parodi Spalazzi <enrique.parodi@airbus.com>
+Date: Fri, 24 Apr 2026 00:17:38 +0200
+Subject: [PATCH 01/10] feat[core,lang]: tolerant scanner, recoverable parser,
+ structured diagnostics
+
+Substrate for later editor-services APIs (tokenize, validate, complete,
+guideAt). The parser/scanner can now produce position-bearing diagnostics
+rather than throwing, so tools can render partial information on
+in-flight input.
+
+- TextSpan and a structured Diagnostic type with severity, code, and
+  position. Diagnostic codes are a closed enum so consumers can dispatch
+  on them.
+- Tolerant scanner mode: emit diagnostics for unexpected bytes and
+  unclosed strings instead of throwing, and keep scanning past the
+  error.
+- Recoverable parser entry point (parseQueryTolerant,
+  parseFileTolerant): synchronize on statement boundaries and record
+  parse errors as diagnostics.
+- AST span coverage: every statement and expression carries the source
+  range it covered, prerequisite for span-based highlighting and
+  cursor-local tooling.
+- Grammar tightening: FROM requires <session>.<bus> (no wildcards in the
+  FROM clause); equality and non-range comparisons no longer chain
+  (a < b < c and a = b = c are rejected; combine with AND).
+
+Expanded Stage 1 test coverage and restored FailedCheckHandler wiring
+across the affected fixtures.
+---
+ docs/users_guide/sql.md                       | 303 +++++++++++++++--
+ libs/core/CMakeLists.txt                      |   2 +
+ .../include/sen/core/lang/code_location.h     |  10 +
+ libs/core/include/sen/core/lang/diagnostic.h  |  80 +++++
+ .../include/sen/core/lang/stl_expression.h    |   2 +
+ libs/core/include/sen/core/lang/stl_parser.h  |  23 +-
+ libs/core/include/sen/core/lang/stl_scanner.h |  27 +-
+ .../include/sen/core/lang/stl_statement.h     |   4 +
+ libs/core/include/sen/core/lang/stl_token.h   |   4 +
+ libs/core/src/lang/diagnostic.cpp             |  44 +++
+ libs/core/src/lang/stl_parser.cpp             | 269 +++++++++++----
+ libs/core/src/lang/stl_scanner.cpp            |  51 ++-
+ libs/core/src/lang/stl_token.cpp              |   4 +
+ libs/core/src/obj/interest.cpp                |   5 +-
+ libs/core/test/base/assert_test.cpp           |   5 +-
+ libs/core/test/base/static_vector_test.cpp    |   2 +-
+ libs/core/test/lang/parser_test.cpp           | 321 ++++++++++++++++++
+ 17 files changed, 1044 insertions(+), 112 deletions(-)
+ create mode 100644 libs/core/include/sen/core/lang/diagnostic.h
+ create mode 100644 libs/core/src/lang/diagnostic.cpp
+
+diff --git a/docs/users_guide/sql.md b/docs/users_guide/sql.md
+index e490ce4..2b883c2 100644
+--- a/docs/users_guide/sql.md
++++ b/docs/users_guide/sql.md
+@@ -101,50 +101,285 @@ WHERE  currentSpeed BETWEEN commandedSpeed - 10.0 AND
+                             commandedSpeed + 10.0
+ ```
+ 
+-The `SELECT` expression syntax is as follows:
++## Lexical structure
+ 
++### Case sensitivity
++
++Keywords are case-sensitive. The control keywords (`SELECT`, `FROM`, `WHERE`, `AND`, `OR`, `NOT`,
++`IN`, `BETWEEN`) are written in UPPER case. The boolean literals `true` and `false` are written in
++lower case. Identifiers (class, bus, session, and property names) preserve the case used in the
++schema definition.
++
++### Keywords (reserved words)
++
++The following words cannot be used as identifiers in a query:
++
++```
++SELECT   FROM    WHERE
++AND      OR      NOT
++IN       BETWEEN
++true     false
++```
++
++### Identifiers
++
++An identifier begins with a letter or underscore and continues with letters, digits, or
++underscores. Identifiers name classes, sessions, buses, and properties.
++
++Two pseudo-properties are always available on every object, regardless of its class:
++
++- `name`: a string, the object's name.
++- `id`: an unsigned integer, the object's identifier.
++
++### String literals
++
++Strings are enclosed in double or single quotes. Both forms are equivalent.
++
++```sql
++"ownship"
++'ownship'
++```
++
++Enumeration values are written as strings using the unqualified value name. For example,
++`"friendly"`, not `"rpr.ForceIdentifierEnum.friendly"`.
++
++### Numeric literals
++
++Integers are written as a non-empty sequence of decimal digits, for example `42`.
++
++Real numbers use a dot as decimal separator and require digits on both sides of the dot. `0.5` is
++valid; `1.` and `.5` are not.
++
++Negative values are not literals. They are produced by applying the unary minus operator to a
++non-negative literal (`- 5`, `-3.14`).
++
++### Boolean literals
++
++`true` and `false`, in lower case.
++
++### Comments and whitespace
++
++Line comments start with `//` and extend to the end of the line. Whitespace (spaces, tabs, carriage
++returns, newlines) separates tokens and is otherwise ignored.
++
++## Grammar
++
++The grammar is given in W3C-style EBNF.
++
++```ebnf
++Query          ::= "SELECT" SelectList "FROM" BusName ( "WHERE" Expression )?
++
++SelectList     ::= "*" | ClassName
++ClassName      ::= Identifier ( "." Identifier )*
++BusName        ::= Identifier "." Identifier
++
++Expression     ::= LogicOr
++LogicOr        ::= LogicAnd  ( "OR"  LogicAnd  )*
++LogicAnd       ::= Equality  ( "AND" Equality  )*
++Equality       ::= Comparison ( ( "=" | "!=" ) Comparison )?
++Comparison     ::= Term ( CompOp Term )?
++                 | Term "NOT"? "BETWEEN" Term "AND" Term
++                 | Term "NOT"? "IN" "(" Term ( "," Term )* ")"
++CompOp         ::= "<" | "<=" | ">" | ">="
++Term           ::= Factor ( ( "+" | "-" ) Factor )*
++Factor         ::= Unary  ( ( "*" | "/" ) Unary  )*
++Unary          ::= ( "!" | "-" | "NOT" ) Unary | Primary
++Primary        ::= Literal | Variable | "(" Expression ")"
++
++Variable       ::= Identifier ( "." Identifier )*
++
++Literal        ::= StringLiteral | IntegerLiteral | RealLiteral | BooleanLiteral
++BooleanLiteral ::= "true" | "false"
++
++Identifier     ::= ( Letter | "_" ) ( Letter | Digit | "_" )*
++StringLiteral  ::= '"' Char* '"' | "'" Char* "'"
++IntegerLiteral ::= Digit+
++RealLiteral    ::= Digit+ "." Digit+
++Letter         ::= [A-Za-z]
++Digit          ::= [0-9]
++```
++
++Notes:
++
++1. `BusName` does not accept wildcards. Both the session and the bus names are mandatory.
++2. Equality (`=`, `!=`) and non-range comparisons (`<`, `<=`, `>`, `>=`) do not chain. `a = b = c`
++   and `a < b < c` are rejected. Use `AND` to combine comparisons: `a = b AND b = c`.
++3. `BETWEEN`, `IN`, `NOT BETWEEN`, and `NOT IN` each act on a single term. Combine them with other
++   conditions using `AND` or `OR`.
++4. The `AND` inside `BETWEEN x AND y` is a structural separator, not a logical conjunction.
++
++### Operator precedence
++
++Listed from lowest to highest. Binary operators associate left-to-right except where noted.
++
++| Level | Operators                                                                   | Notes                  |
++| ----- | --------------------------------------------------------------------------- | ---------------------- |
++| 1     | `OR`                                                                        | logical disjunction    |
++| 2     | `AND`                                                                       | logical conjunction    |
++| 3     | `=`, `!=`                                                                   | no chaining            |
++| 4     | `<`, `<=`, `>`, `>=`, `BETWEEN ... AND ...`, `IN (...)`, `NOT BETWEEN`, `NOT IN` | no chaining        |
++| 5     | `+`, `-` (binary)                                                           |                        |
++| 6     | `*`, `/`                                                                    |                        |
++| 7     | `!`, unary `-`, `NOT`                                                       | right-associative      |
++| 8     | `.` (path navigation)                                                       | property or name path  |
++
++## Semantics
++
++### SELECT clause
++
++`SELECT ClassName` expresses interest in objects of the given class. The class name may be qualified
++with its package, for example `rpr.PhysicalEntity`. `SELECT *` expresses interest in objects of any
++class.
++
++### FROM clause
++
++`FROM session.bus` names the session and the bus on which to match objects. Both parts are
++mandatory. Wildcards are not accepted.
++
++### WHERE clause
++
++`WHERE` is optional. A query without a `WHERE` clause matches every object of the selected class on
++the selected bus. When present, the condition is evaluated against each candidate object and the
++object is included when the condition is `true`.
++
++Conditions are composed with:
++
++- `AND`: both operands must hold.
++- `OR`: at least one operand must hold.
++- `NOT`: inverts its operand.
++
++### Property paths
++
++A variable refers to a property through a dotted path:
++
++- Top-level property: `focusLevel`.
++- Struct field: `position.x`.
++- Variant alternative: `spatial.SpatialFPStruct.lon`. The first segment is the property name, the
++  next names the variant alternative, and any remaining segments navigate into that alternative's
++  structure.
++- Pseudo-properties: `name` (string) and `id` (unsigned integer).
++
++### Variants
++
++When a variable path targets a specific variant alternative and the variant does not currently hold
++that alternative, the comparison returns `false`. No error is raised.
++
++### Optional properties
++
++An optional property may or may not carry a value. When it does not carry a value, any comparison
++involving it evaluates to `false`. This means `WHERE optionalValue > 5` matches only objects for
++which the property is present and its value is greater than 5.
++
++There is currently no syntax to ask whether an optional is empty or present. An explicit
++`IS NULL` / `IS NOT NULL` form is planned; see [Planned extensions](#planned-extensions).
++
++### Range checks (`BETWEEN`)
++
++`x BETWEEN min AND max` matches when `x` is greater than or equal to `min` and less than or equal
++to `max`. When `min` and `max` are both numeric literals and `min` is greater than `max`, the query
++is rejected at parse time.
++
++### Set membership (`IN`)
++
++`x IN (v1, v2, ..., vn)` matches when `x` equals any of the listed values. The value list must
++contain at least one value.
++
++## More examples
++
++The following queries isolate individual features. Each example is a complete, valid query.
++
++### Any class on a bus
++
++`SELECT *` matches objects of every class published on the bus.
++
++```sql
++SELECT * FROM se.env WHERE isActive = true
++```
++
++### No `WHERE` clause
++
++Omitting `WHERE` matches every object of the class on the bus.
++
++```sql
++SELECT rpr.Aircraft FROM se.env
++```
++
++### Match by id
++
++`id` is a pseudo-property available on every object.
++
++```sql
++SELECT * FROM se.env WHERE id = 42
++```
++
++### Boolean property with `NOT`
++
++A boolean property can be used directly as a condition. `NOT` negates it.
++
++```sql
++SELECT se.Sensor FROM se.env WHERE NOT isFaulty
+ ```
+-SELECT class_name
+-FROM bus_name
+-WHERE condition
++
++### Inequality
++
++```sql
++SELECT rpr.Aircraft FROM se.env WHERE forceIdentifier != "opposing"
+ ```
+ 
+-The operators in the `WHERE` clause are:
++### `NOT IN`
++
++```sql
++SELECT rpr.Aircraft FROM se.env WHERE forceIdentifier NOT IN ("friendly", "neutral")
++```
+ 
+-| Operator          | Description                         |
+-| ----------------- | ----------------------------------- |
+-| `=`               | Equal                               |
+-| `>`               | Greater than                        |
+-| `<`               | Lower than                          |
+-| `>=`              | Greater than or equal               |
+-| `<=`              | Lower than or equal                 |
+-| `BETWEEN x AND y` | Between a certain range             |
+-| `IN (x, y, ...)`  | To specify multiple possible values |
++### `NOT BETWEEN`
+ 
+-The `WHERE` clause can be combined with `AND`, `OR`, and `NOT` operators.
++```sql
++SELECT se.Engine FROM se.env WHERE temperatureC NOT BETWEEN -10.0 AND 85.0
++```
+ 
+-The `AND` and `OR` operators are used to filter objects based on more than one condition:
++### Optional property
+ 
+-- The `AND` operator selects an object if all the conditions separated by `AND` are `true`.
+-- The `OR` operator selects an object if any of the conditions separated by `OR` is `true`.
++An empty optional silently excludes the object from the match.
+ 
+-The `NOT` operator selects an object if the condition(s) is `NOT true`.
++```sql
++SELECT se.Drone FROM se.env WHERE batteryHours > 2.0
++```
+ 
+-Regarding values:
++### Variant alternative
+ 
+-- Strings be "double-quoted".
+-- Booleans can be `true` or `false`.
+-- Integers as usual.
+-- Real numbers use the dot for the decimal part (as usual).
+-- Enumerations are quoted and not qualified (i.e. use "friendly" instead of
+-  "rpr.ForceIdentifierEnum.friendly").
++Navigating to a variant alternative matches only objects whose variant currently holds that
++alternative.
++
++```sql
++SELECT rpr.PhysicalEntity FROM se.env WHERE spatial.SpatialFPStruct.lat >= 34.0
++```
++
++### Combined conditions
++
++```sql
++SELECT se.Aircraft FROM se.env
++ WHERE (altitude > 10000 OR speed > 300)
++   AND NOT isSimulated
++```
++
++## Planned extensions
++
++The following extensions are planned. They are not yet accepted by the parser.
++
++### `IS NULL` and `IS NOT NULL`
++
++Explicit presence checks for optional properties:
++
++```sql
++WHERE maintenanceWindow IS NULL
++WHERE operator IS NOT NULL
++```
+ 
+-Regarding variables:
++These forms will be added as a single comparison operator family alongside the existing
++comparators. They apply to optional properties only; using them on a non-optional property is an
++error.
+ 
+-- You can use a property name.
+-- You can use the "name" pseudo-property, which contains a string.
+-- You can use the "id" pseudo-property, which contains an unsigned integer.
+-- If the property or field is a structure, you need to refer to a field (i.e. position.x).
+-- If the property or field is a variant, you need to specify the type (i.e.
+-  spatial.SpatialFPStruct.lon).
+-- If the variant doesn't contain a value of the specified type, the operator returns `false`.
++Until this is implemented, there is no way to react specifically to the absence of a value. You can
++only filter positively on the presence of a value, since comparisons on empty optionals evaluate to
++`false` and are excluded from the result.
+diff --git a/libs/core/CMakeLists.txt b/libs/core/CMakeLists.txt
+index 4d6e565..5c3c073 100644
+--- a/libs/core/CMakeLists.txt
++++ b/libs/core/CMakeLists.txt
+@@ -201,6 +201,7 @@ set(meta_sources
+ 
+ set(lang_public_headers
+     include/sen/core/lang/code_location.h
++    include/sen/core/lang/diagnostic.h
+     include/sen/core/lang/error_reporter.h
+     include/sen/core/lang/stl_expression.h
+     include/sen/core/lang/stl_parser.h
+@@ -213,6 +214,7 @@ set(lang_public_headers
+ )
+ 
+ set(lang_sources
++    src/lang/diagnostic.cpp
+     src/lang/error_reporter.cpp
+     src/lang/stl_parser.cpp
+     src/lang/stl_resolver.cpp
+diff --git a/libs/core/include/sen/core/lang/code_location.h b/libs/core/include/sen/core/lang/code_location.h
+index 074ce93..3619190 100644
+--- a/libs/core/include/sen/core/lang/code_location.h
++++ b/libs/core/include/sen/core/lang/code_location.h
+@@ -23,6 +23,16 @@ struct CodeLocation
+   std::size_t offset;  /// Offset relative to the start of the source code
+ };
+ 
++/// Half-open byte range [begin, end) into some source buffer.
++///
++/// Named `TextSpan` (rather than `Span`) because `sen::Span<T>` already denotes a contiguous
++/// view template, and unqualified lookup inside `sen::lang` would otherwise clash.
++struct TextSpan
++{
++  std::size_t begin = 0U;
++  std::size_t end = 0U;
++};
++
+ /// @}
+ 
+ }  // namespace sen::lang
+diff --git a/libs/core/include/sen/core/lang/diagnostic.h b/libs/core/include/sen/core/lang/diagnostic.h
+new file mode 100644
+index 0000000..455100b
+--- /dev/null
++++ b/libs/core/include/sen/core/lang/diagnostic.h
+@@ -0,0 +1,80 @@
++// === diagnostic.h ====================================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#ifndef SEN_CORE_LANG_DIAGNOSTIC_H
++#define SEN_CORE_LANG_DIAGNOSTIC_H
++
++// sen
++#include "sen/core/lang/code_location.h"
++
++// std
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace sen::lang
++{
++
++/// \addtogroup lang
++/// @{
++
++/// How serious a diagnostic is. Follows the LSP convention.
++enum class Severity
++{
++  info,
++  warning,
++  error,
++};
++
++/// Stable identifier for a class of diagnostic.
++///
++/// Enumerator names may be refactored; the short tags returned by `toString` are the
++/// codebook contract that tests, doc anchors, logs, and future telemetry rely on.
++enum class DiagnosticCode
++{
++  // scanner
++  scanInvalidChar,
++  scanUnterminatedString,
++
++  // parser
++  parseSyntax,
++  parseChainedComparison,
++  parseBetweenInverted,
++
++  // validator (errors: property problem on a *known* class)
++  validateUnknownProperty,
++  validateTypeMismatch,
++
++  // validator (infos: self-clearing as the registry / bus lookup catches up)
++  validateUnknownClass,
++  validateUnknownSession,
++  validateUnknownBus,
++};
++
++/// Short, stable tag for a diagnostic code. Intended for logs, UI, and doc anchors.
++[[nodiscard]] std::string_view toString(DiagnosticCode code) noexcept;
++
++/// A structured message produced by the editor services (scanner, parser, validator, ...).
++///
++/// Diagnostics are position-bearing: each one carries a TextSpan into the source buffer so that
++/// tools can highlight the offending region. `code` is the machine-readable class;
++/// `message` is the human-readable text.
++struct Diagnostic
++{
++  TextSpan       span = {};
++  Severity       severity = Severity::error;
++  DiagnosticCode code = DiagnosticCode::parseSyntax;
++  std::string    message = {};
++};
++
++using DiagnosticList = std::vector<Diagnostic>;
++
++/// @}
++
++}  // namespace sen::lang
++
++#endif  // SEN_CORE_LANG_DIAGNOSTIC_H
+diff --git a/libs/core/include/sen/core/lang/stl_expression.h b/libs/core/include/sen/core/lang/stl_expression.h
+index 891d010..be083ac 100644
+--- a/libs/core/include/sen/core/lang/stl_expression.h
++++ b/libs/core/include/sen/core/lang/stl_expression.h
+@@ -8,6 +8,7 @@
+ #ifndef SEN_CORE_LANG_STL_EXPRESSION_H
+ #define SEN_CORE_LANG_STL_EXPRESSION_H
+ 
++#include "sen/core/lang/code_location.h"
+ #include "sen/core/lang/stl_token.h"
+ 
+ namespace sen::lang
+@@ -121,6 +122,7 @@ using StlExprVal = std::variant<std::monostate,
+ struct StlExpr
+ {
+   StlExprVal value;
++  TextSpan span = {};
+ };
+ 
+ /// @}
+diff --git a/libs/core/include/sen/core/lang/stl_parser.h b/libs/core/include/sen/core/lang/stl_parser.h
+index 21689ba..59c8946 100644
+--- a/libs/core/include/sen/core/lang/stl_parser.h
++++ b/libs/core/include/sen/core/lang/stl_parser.h
+@@ -9,6 +9,7 @@
+ #define SEN_CORE_LANG_STL_PARSER_H
+ 
+ // sen
++#include "sen/core/lang/diagnostic.h"
+ #include "sen/core/lang/stl_expression.h"
+ #include "sen/core/lang/stl_statement.h"
+ #include "sen/core/lang/stl_token.h"
+@@ -43,6 +44,23 @@ public:
+   /// Parse the tokens as a query statement.
+   [[nodiscard]] QueryStatement parseQuery();
+ 
++  /// Result of a tolerant query parse.
++  struct TolerantQueryResult
++  {
++    QueryStatement query;
++    DiagnosticList diagnostics;
++  };
++
++  /// Parse the tokens as a query statement without throwing.
++  ///
++  /// The parser records every problem it sees as a `Diagnostic` and keeps going, returning
++  /// whatever partial AST it managed to build. Intended for editor services; callers that
++  /// need a hard failure on malformed input should still use `parseQuery()`.
++  ///
++  /// Any pre-existing diagnostics (e.g. from a tolerant scanner) should be passed in;
++  /// they are merged into the returned list.
++  [[nodiscard]] TolerantQueryResult parseQueryTolerant(DiagnosticList incoming = {});
++
+ private:  // declarations
+   [[nodiscard]] StlStatement declaration();
+   [[nodiscard]] StlImportStatement importDeclaration();
+@@ -67,6 +85,7 @@ private:  // declarations
+   [[nodiscard]] StlArgStatement argStatement();
+   [[nodiscard]] std::optional<StlAttributeList> maybeAttributeList(const std::string& subjectName);
+   [[nodiscard]] StlAttributeList attributeList(const std::string& subjectName);
++  void parseQueryInto(QueryStatement& statement);
+   [[nodiscard]] BusNameStatement busNameStatement();
+   [[nodiscard]] std::shared_ptr<StlExpr> expression();
+   [[nodiscard]] std::shared_ptr<StlExpr> logicOr();
+@@ -91,7 +110,7 @@ private:  // utility
+   [[nodiscard]] bool isAtEnd() const noexcept;
+   [[nodiscard]] const StlToken& advance();
+   [[nodiscard]] const StlToken& consume(StlTokenType type, const std::vector<std::string>& message);
+-  [[nodiscard]] ParseError error(const StlToken& token, const std::string& message) const;
++  [[nodiscard]] ParseError error(const StlToken& token, const std::string& message);
+   void checkNotReserved(const StlToken& token);
+ 
+ private:  // others
+@@ -104,6 +123,8 @@ private:
+   const StlTokenList& tokens_;
+   std::size_t current_ = 0U;
+   std::vector<StlToken> previousComment_;
++  bool tolerant_ = false;
++  DiagnosticList diagnostics_;
+ };
+ 
+ /// @}
+diff --git a/libs/core/include/sen/core/lang/stl_scanner.h b/libs/core/include/sen/core/lang/stl_scanner.h
+index 659f4b5..b8e2b79 100644
+--- a/libs/core/include/sen/core/lang/stl_scanner.h
++++ b/libs/core/include/sen/core/lang/stl_scanner.h
+@@ -10,6 +10,7 @@
+ 
+ #include "sen/core/base/class_helpers.h"
+ #include "sen/core/lang/code_location.h"
++#include "sen/core/lang/diagnostic.h"
+ #include "sen/core/lang/stl_token.h"
+ 
+ // std
+@@ -26,6 +27,21 @@ namespace sen::lang
+ /// \addtogroup lang
+ /// @{
+ 
++/// Controls how the scanner reacts to malformed input.
++///
++/// `strict` throws the first time it sees something it cannot tokenize (legacy behavior,
++/// used by the STL loader and the production query path).
++///
++/// `tolerant` never throws: unrecognized characters become `invalidChar` tokens,
++/// unterminated strings become `partialString` tokens, and a diagnostic is recorded for
++/// each. Editor services use this mode so that highlighting/completion keep working on
++/// half-typed input.
++enum class ScanMode
++{
++  strict,
++  tolerant,
++};
++
+ /// Converts a string into a list of tokens.
+ class StlScanner
+ {
+@@ -33,13 +49,16 @@ class StlScanner
+ 
+ public:
+   /// The string is stored for eventual scanning.
+-  explicit StlScanner(const std::string& program);
++  explicit StlScanner(const std::string& program, ScanMode mode = ScanMode::strict);
+   ~StlScanner() = default;
+ 
+ public:
+-  /// Scans the string. Throws in case of error.
++  /// Scans the string. Throws in case of error when mode is `strict`.
+   [[nodiscard]] const StlTokenList& scanTokens();
+ 
++  /// Diagnostics produced during tolerant scanning. Empty after a successful strict scan.
++  [[nodiscard]] const DiagnosticList& diagnostics() const noexcept { return diagnostics_; }
++
+ private:
+   enum class Sign
+   {
+@@ -50,7 +69,7 @@ private:
+ private:
+   void scanToken();
+   void addToken(StlTokenType type, const Var& value);
+-  void error(const std::string& message) const;
++  void error(const std::string& message);
+   void string(char endingChar);
+   void comment();
+   void ruler();
+@@ -69,6 +88,8 @@ private:  // utility
+ private:
+   const std::string& program_;
+   StlTokenList tokens_;
++  DiagnosticList diagnostics_;
++  ScanMode mode_ = ScanMode::strict;
+   std::size_t start_ = 0U;
+   CodeLocation current_;
+ };
+diff --git a/libs/core/include/sen/core/lang/stl_statement.h b/libs/core/include/sen/core/lang/stl_statement.h
+index 1c1c439..b54ae07 100644
+--- a/libs/core/include/sen/core/lang/stl_statement.h
++++ b/libs/core/include/sen/core/lang/stl_statement.h
+@@ -9,6 +9,7 @@
+ #define SEN_CORE_LANG_STL_STATEMENT_H
+ 
+ // sen
++#include "sen/core/lang/code_location.h"
+ #include "sen/core/lang/stl_expression.h"
+ #include "sen/core/lang/stl_token.h"
+ 
+@@ -44,6 +45,7 @@ struct StlTypeNameStatement
+ {
+   std::vector<StlToken> path;
+   std::string qualifiedName;
++  TextSpan span = {};
+ };
+ 
+ struct StlStructFieldStatement
+@@ -198,6 +200,7 @@ struct BusNameStatement
+ {
+   StlToken session;
+   StlToken bus;
++  TextSpan span = {};
+ };
+ 
+ struct QueryStatement
+@@ -205,6 +208,7 @@ struct QueryStatement
+   std::optional<StlTypeNameStatement> type;
+   BusNameStatement bus;
+   std::shared_ptr<StlExpr> condition;
++  TextSpan span = {};
+ };
+ 
+ /// @}
+diff --git a/libs/core/include/sen/core/lang/stl_token.h b/libs/core/include/sen/core/lang/stl_token.h
+index 92d3919..7d8ce75 100644
+--- a/libs/core/include/sen/core/lang/stl_token.h
++++ b/libs/core/include/sen/core/lang/stl_token.h
+@@ -92,6 +92,10 @@ enum class StlTokenType
+   // others
+   comment,
+   endOfFile,
++
++  // tolerant scanning
++  invalidChar,    /// one source character that is not part of the alphabet
++  partialString,  /// string literal that was never closed
+ };
+ 
+ struct StlToken
+diff --git a/libs/core/src/lang/diagnostic.cpp b/libs/core/src/lang/diagnostic.cpp
+new file mode 100644
+index 0000000..91a5a72
+--- /dev/null
++++ b/libs/core/src/lang/diagnostic.cpp
+@@ -0,0 +1,44 @@
++// === diagnostic.cpp ==================================================================================================
++//                                               Sen Infrastructure
++//                   Released under the Apache License v2.0 (SPDX-License-Identifier Apache-2.0).
++//                                    See the LICENSE.txt file for more information.
++//                   © Airbus SAS, Airbus Helicopters, and Airbus Defence and Space SAU/GmbH/SAS.
++// =====================================================================================================================
++
++#include "sen/core/lang/diagnostic.h"
++
++// sen
++#include "sen/core/base/compiler_macros.h"
++
++namespace sen::lang
++{
++
++std::string_view toString(DiagnosticCode code) noexcept
++{
++  switch (code)
++  {
++    case DiagnosticCode::scanInvalidChar:
++      return "E_S_INVALID_CHAR";
++    case DiagnosticCode::scanUnterminatedString:
++      return "E_S_UNTERMINATED_STRING";
++    case DiagnosticCode::parseSyntax:
++      return "E_P_SYNTAX";
++    case DiagnosticCode::parseChainedComparison:
++      return "E_P_CHAINED_COMPARISON";
++    case DiagnosticCode::parseBetweenInverted:
++      return "E_P_BETWEEN_INVERTED";
++    case DiagnosticCode::validateUnknownProperty:
++      return "E_V_UNKNOWN_PROPERTY";
++    case DiagnosticCode::validateTypeMismatch:
++      return "E_V_TYPE_MISMATCH";
++    case DiagnosticCode::validateUnknownClass:
++      return "I_V_UNKNOWN_CLASS";
++    case DiagnosticCode::validateUnknownSession:
++      return "I_V_UNKNOWN_SESSION";
++    case DiagnosticCode::validateUnknownBus:
++      return "I_V_UNKNOWN_BUS";
++  }
++  SEN_UNREACHABLE();
++}
++
++}  // namespace sen::lang
+diff --git a/libs/core/src/lang/stl_parser.cpp b/libs/core/src/lang/stl_parser.cpp
+index 5077771..1cc3427 100644
+--- a/libs/core/src/lang/stl_parser.cpp
++++ b/libs/core/src/lang/stl_parser.cpp
+@@ -30,6 +30,57 @@
+ namespace sen::lang
+ {
+ 
++namespace
++{
++
++TextSpan tokenSpan(const StlToken& t)
++{
++  // CodeLocation::offset points to the position *after* the token (the scanner stores
++  // current_ at emit time), so the token starts at loc.offset - lexeme.size().
++  const std::size_t start = t.loc.offset >= t.lexeme.size() ? t.loc.offset - t.lexeme.size() : 0U;
++  return TextSpan {start, t.loc.offset};
++}
++
++TextSpan mergeSpans(const TextSpan& a, const TextSpan& b) { return TextSpan {a.begin, b.end}; }
++
++std::shared_ptr<StlExpr> makeExpr(StlExprVal value, const TextSpan& span)
++{
++  return std::make_shared<StlExpr>(StlExpr {std::move(value), span});
++}
++
++// Human-readable display form for a token, used inside diagnostic messages so users see what the
++// parser actually found (e.g. "end of input", "identifier 'foo'", "'SELECT'").
++std::string tokenDisplay(const StlToken& t)
++{
++  switch (t.type)  // NOSONAR
++  {
++    case StlTokenType::endOfFile:
++      return "end of input";
++    case StlTokenType::identifier:
++      return "identifier '" + t.lexeme + "'";
++    case StlTokenType::string:
++      return "string literal";
++    case StlTokenType::real:
++    case StlTokenType::integral:
++      return "number '" + t.lexeme + "'";
++    case StlTokenType::comment:
++      return "comment";
++    case StlTokenType::invalidChar:
++      return "invalid character '" + t.lexeme + "'";
++    case StlTokenType::partialString:
++      return "unterminated string";
++    default:
++      return t.lexeme.empty() ? std::string("token") : ("'" + t.lexeme + "'");
++  }
++}
++
++std::string expectedGot(const std::string& expected, const StlToken& got)
++{
++  return "Expected " + expected + "; got " + tokenDisplay(got);
++}
++
++}  // namespace
++
+ StlParser::StlParser(const StlTokenList& tokens): tokens_(tokens) {}
+ 
+ std::vector<StlStatement> StlParser::parse()
+@@ -155,12 +206,14 @@ StlTypeNameStatement StlParser::typeNameStatement(const std::vector<std::string>
+ 
+   statement.path.push_back(consume(StlTokenType::identifier, messages));
+   statement.qualifiedName.append(statement.path.back().lexeme);
++  statement.span = tokenSpan(statement.path.back());
+ 
+   while (match({StlTokenType::dot}))
+   {
+     statement.path.push_back(consume(StlTokenType::identifier, messages));
+     statement.qualifiedName.append(".");
+     statement.qualifiedName.append(statement.path.back().lexeme);
++    statement.span = mergeSpans(statement.span, tokenSpan(statement.path.back()));
+   }
+ 
+   return statement;
+@@ -985,46 +1038,89 @@ StlToken StlParser::literal()
+     return previous();
+   }
+ 
+-  throw error(peek(), "Expecting literal");
++  throw error(peek(), expectedGot("a literal value (number, string, true, or false)", peek()));
+ }
+ 
+ QueryStatement StlParser::parseQuery()
+ {
+-  // query -> 'SELECT' ('*' | identifier) 'FROM' busname 'WHERE' expression
+-
+   QueryStatement statement = {};
++  parseQueryInto(statement);
++  return statement;
++}
+ 
+-  std::ignore = consume(StlTokenType::keywordSelect, {"Expected SELECT keyword in query"});
++void StlParser::parseQueryInto(QueryStatement& statement)
++{
++  // query -> 'SELECT' ('*' | typename) 'FROM' busname ['WHERE' expression]
++  //
++  // Writes each piece into `statement` as soon as it is parsed so that tolerant callers can
++  // recover a partial AST if a later piece fails.
++
++  const StlToken& selectTok =
++    consume(StlTokenType::keywordSelect, {expectedGot("'SELECT' to start the query", peek())});
++  const TextSpan startSpan = tokenSpan(selectTok);
++  TextSpan endSpan = startSpan;
++  statement.span = startSpan;
+ 
+   // * means any class, and we leave an empty type statement
+   if (!match({StlTokenType::star}))
+   {
+-    statement.type = typeNameStatement({"Expecting class name for SELECT statement"});
++    statement.type = typeNameStatement({expectedGot("a class name (or '*') after 'SELECT'", peek())});
++    endSpan = statement.type->span;
++  }
++  else
++  {
++    endSpan = tokenSpan(previous());
+   }
++  statement.span = mergeSpans(startSpan, endSpan);
+ 
+-  std::ignore = consume(StlTokenType::keywordFrom, {"Expected FROM keyword in query"});
++  std::ignore =
++    consume(StlTokenType::keywordFrom, {expectedGot("'FROM' after the SELECT target", peek())});
+   statement.bus = busNameStatement();
++  endSpan = statement.bus.span;
++  statement.span = mergeSpans(startSpan, endSpan);
+ 
+   if (!isAtEnd())
+   {
+-    std::ignore = consume(StlTokenType::keywordWhere, {"Expected WHERE keyword in query"});
++    std::ignore =
++      consume(StlTokenType::keywordWhere, {expectedGot("'WHERE' after bus name (or end of query)", peek())});
+     statement.condition = expression();
++    endSpan = statement.condition->span;
++    statement.span = mergeSpans(startSpan, endSpan);
+   }
++}
+ 
+-  return statement;
++StlParser::TolerantQueryResult StlParser::parseQueryTolerant(DiagnosticList incoming)
++{
++  tolerant_ = true;
++  diagnostics_ = std::move(incoming);
++  QueryStatement statement = {};
++  try
++  {
++    parseQueryInto(statement);
++  }
++  catch (const ParseError&)
++  {
++    // `statement` keeps whatever pieces were populated before the throw.
++  }
++  tolerant_ = false;
++  return TolerantQueryResult {std::move(statement), std::move(diagnostics_)};
+ }
+ 
+ BusNameStatement StlParser::busNameStatement()
+ {
+-  // busname -> identifier.identifier | '*'
++  // busname -> identifier '.' identifier
+   BusNameStatement statement;
+ 
+-  if (!match({StlTokenType::star}))
+-  {
+-    statement.session = consume(StlTokenType::identifier, {"Expecting session name"});
+-    std::ignore = consume(StlTokenType::dot, {"Expecting '.' after session name"});
+-    statement.bus = consume(StlTokenType::identifier, {"Expecting bus name"});
+-  }
++  statement.session = consume(
++    StlTokenType::identifier,
++    {expectedGot("a session name after 'FROM' (bus names use the form <session>.<bus>)", peek())});
++  std::ignore = consume(StlTokenType::dot,
++                        {expectedGot("'.' after session name '" + statement.session.lexeme +
++                                       "' (bus names use the form <session>.<bus>)",
++                                     peek())});
++  statement.bus = consume(StlTokenType::identifier,
++                          {expectedGot("a bus name after '" + statement.session.lexeme + ".'", peek())});
++  statement.span = mergeSpans(tokenSpan(statement.session), tokenSpan(statement.bus));
+ 
+   return statement;
+ }
+@@ -1038,7 +1134,7 @@ std::shared_ptr<StlExpr> StlParser::logicOr()
+   while (match({StlTokenType::keywordOr}))
+   {
+     auto rhs = logicAnd();
+-    expr = std::make_shared<StlExpr>(StlExpr {StlExprVal {StlLogicalExpr {expr, StlLogicalOperator::logicalOr, rhs}}});
++    expr = makeExpr(StlLogicalExpr {expr, StlLogicalOperator::logicalOr, rhs}, mergeSpans(expr->span, rhs->span));
+   }
+ 
+   return expr;
+@@ -1051,7 +1147,7 @@ std::shared_ptr<StlExpr> StlParser::logicAnd()
+   while (match({StlTokenType::keywordAnd}))
+   {
+     auto rhs = equality();
+-    expr = std::make_shared<StlExpr>(StlExpr {StlExprVal {StlLogicalExpr {expr, StlLogicalOperator::logicalAnd, rhs}}});
++    expr = makeExpr(StlLogicalExpr {expr, StlLogicalOperator::logicalAnd, rhs}, mergeSpans(expr->span, rhs->span));
+   }
+ 
+   return expr;
+@@ -1061,15 +1157,22 @@ std::shared_ptr<StlExpr> StlParser::equality()
+ {
+   auto expr = comparison();
+ 
+-  while (match({StlTokenType::bangEqual, StlTokenType::equal}))
++  if (match({StlTokenType::bangEqual, StlTokenType::equal}))
+   {
+     auto op = previous().type == StlTokenType::equal ? StlBinaryOperator::eq : StlBinaryOperator::ne;
+     auto rhs = comparison();
+-    expr = std::make_shared<StlExpr>(StlExpr {StlExprVal {StlBinaryExpr {expr, op, rhs}}});
++    expr = makeExpr(StlBinaryExpr {expr, op, rhs}, mergeSpans(expr->span, rhs->span));
++
++    if (check(StlTokenType::bangEqual) || check(StlTokenType::equal))
++    {
++      throw error(peek(),
++                  "Equality operators do not chain: writing 'a = b " + peek().lexeme +
++                    " c' is ambiguous. Combine with AND: 'a = b AND b " + peek().lexeme + " c'");
++    }
+   }
+ 
+   return expr;
+-}  // namespace sen::lang
++}
+ 
+ std::shared_ptr<StlExpr> StlParser::comparison()
+ {
+@@ -1087,8 +1190,10 @@ std::shared_ptr<StlExpr> StlParser::comparison()
+   if (match({StlTokenType::keywordBetween}))
+   {
+     auto min = term();
+-    std::ignore =
+-      consume(StlTokenType::keywordAnd, {"Expecting 'AND' after the minimum term of the BETWEEN expression"});
++    std::ignore = consume(
++      StlTokenType::keywordAnd,
++      {expectedGot("'AND' between the minimum and maximum of 'BETWEEN' (syntax is <x> BETWEEN <min> AND <max>)",
++                   peek())});
+     auto max = term();
+ 
+     if (std::holds_alternative<StlLiteralExpr>(min->value) && std::holds_alternative<StlLiteralExpr>(max->value))
+@@ -1102,21 +1207,27 @@ std::shared_ptr<StlExpr> StlParser::comparison()
+       {
+         if (std::stod(minValue.value.lexeme) > std::stod(maxValue.value.lexeme))
+         {
+-          std::string err("'BETWEEN' statement requires min value '");
++          std::string err("'BETWEEN' requires min <= max, but min '");
+           err.append(minValue.value.lexeme);
+-          err.append("' to be less or equal than max value '");
++          err.append("' is greater than max '");
+           err.append(maxValue.value.lexeme);
+-          err.append("'");
++          err.append("' (did you mean '");
++          err.append(maxValue.value.lexeme);
++          err.append(" AND ");
++          err.append(minValue.value.lexeme);
++          err.append("'?)");
+           throw error(peek(), err);
+         }
+       }
+     }
+ 
+-    expr = std::make_shared<StlExpr>(StlExpr {StlExprVal {StlBetweenExpr {expr, min, max, isNotInBetween}}});
++    expr = makeExpr(StlBetweenExpr {expr, min, max, isNotInBetween}, mergeSpans(expr->span, max->span));
+   }
+   else if (match({StlTokenType::keywordIn}))
+   {
+-    std::ignore = consume(StlTokenType::leftParen, {"Expecting '(' after the IN keyword"});
++    std::ignore = consume(StlTokenType::leftParen,
++                          {expectedGot("'(' after 'IN' to start the value list (syntax is <x> IN (a, b, c))",
++                                       peek())});
+ 
+     StlInExpr inExpr;
+     inExpr.notIn = isNotInBetween;
+@@ -1128,40 +1239,49 @@ std::shared_ptr<StlExpr> StlParser::comparison()
+       {
+         break;
+       }
+-      std::ignore = consume(StlTokenType::comma, {"Expecting ',' or ')' to continue with IN expression"});
++      std::ignore =
++        consume(StlTokenType::comma,
++                {expectedGot("',' to add another value or ')' to close the IN list", peek())});
+     }
+-    expr = std::make_shared<StlExpr>(StlExpr {StlExprVal {std::move(inExpr)}});
++    const TextSpan closeSpan = tokenSpan(previous());
++    const TextSpan lhsSpan = expr->span;
++    expr = makeExpr(std::move(inExpr), mergeSpans(lhsSpan, closeSpan));
+   }
+-  else
++  else if (match({StlTokenType::greater, StlTokenType::greaterEqual, StlTokenType::less, StlTokenType::lessEqual}))
+   {
+-    while (match({StlTokenType::greater, StlTokenType::greaterEqual, StlTokenType::less, StlTokenType::lessEqual}))
++    StlBinaryOperator op = {};
++
++    switch (previous().type)
+     {
+-      StlBinaryOperator op = {};
++      case StlTokenType::greater:
++        op = StlBinaryOperator::gt;
++        break;
+ 
+-      switch (previous().type)
+-      {
+-        case StlTokenType::greater:
+-          op = StlBinaryOperator::gt;
+-          break;
++      case StlTokenType::greaterEqual:
++        op = StlBinaryOperator::ge;
++        break;
+ 
+-        case StlTokenType::greaterEqual:
+-          op = StlBinaryOperator::ge;
+-          break;
++      case StlTokenType::less:
++        op = StlBinaryOperator::lt;
++        break;
+ 
+-        case StlTokenType::less:
+-          op = StlBinaryOperator::lt;
+-          break;
++      case StlTokenType::lessEqual:
++        op = StlBinaryOperator::le;
++        break;
+ 
+-        case StlTokenType::lessEqual:
+-          op = StlBinaryOperator::le;
+-          break;
++      default:
++        break;
++    }
+ 
+-        default:
+-          break;
+-      }
++    auto rhs = term();
++    expr = makeExpr(StlBinaryExpr {expr, op, rhs}, mergeSpans(expr->span, rhs->span));
+ 
+-      auto rhs = term();
+-      expr = std::make_shared<StlExpr>(StlExpr {StlExprVal {StlBinaryExpr {expr, op, rhs}}});
++    if (check(StlTokenType::greater) || check(StlTokenType::greaterEqual) || check(StlTokenType::less) ||
++        check(StlTokenType::lessEqual))
++    {
++      throw error(peek(),
++                  "Comparison operators do not chain: writing 'a < b " + peek().lexeme +
++                    " c' is ambiguous. Combine with AND: 'a < b AND b " + peek().lexeme + " c'");
+     }
+   }
+ 
+@@ -1176,7 +1296,7 @@ std::shared_ptr<StlExpr> StlParser::term()
+   {
+     auto op = previous().type == StlTokenType::minus ? StlBinaryOperator::subtract : StlBinaryOperator::add;
+     auto rhs = factor();
+-    expr = std::make_shared<StlExpr>(StlExpr {StlExprVal {StlBinaryExpr {expr, op, rhs}}});
++    expr = makeExpr(StlBinaryExpr {expr, op, rhs}, mergeSpans(expr->span, rhs->span));
+   }
+ 
+   return expr;
+@@ -1190,7 +1310,7 @@ std::shared_ptr<StlExpr> StlParser::factor()
+   {
+     auto op = previous().type == StlTokenType::slash ? StlBinaryOperator::divide : StlBinaryOperator::multiply;
+     auto rhs = unary();
+-    expr = std::make_shared<StlExpr>(StlExpr {StlExprVal {StlBinaryExpr {expr, op, rhs}}});
++    expr = makeExpr(StlBinaryExpr {expr, op, rhs}, mergeSpans(expr->span, rhs->span));
+   }
+ 
+   return expr;
+@@ -1200,9 +1320,10 @@ std::shared_ptr<StlExpr> StlParser::unary()
+ {
+   if (match({StlTokenType::bang, StlTokenType::minus, StlTokenType::keywordNot}))
+   {
++    const TextSpan opSpan = tokenSpan(previous());
+     auto op = previous().type == StlTokenType::minus ? StlUnaryOperator::negate : StlUnaryOperator::logicalNot;
+     auto rhs = unary();
+-    return std::make_shared<StlExpr>(StlExpr {StlExprVal {StlUnaryExpr {op, rhs}}});
++    return makeExpr(StlUnaryExpr {op, rhs}, mergeSpans(opSpan, rhs->span));
+   }
+ 
+   return primary();
+@@ -1216,7 +1337,7 @@ std::shared_ptr<StlExpr> StlParser::primary()
+              StlTokenType::keywordTrue,
+              StlTokenType::keywordFalse}))
+   {
+-    return std::make_shared<StlExpr>(StlExpr {StlExprVal {StlLiteralExpr {previous()}}});
++    return makeExpr(StlLiteralExpr {previous()}, tokenSpan(previous()));
+   }
+ 
+   if (check(StlTokenType::identifier))
+@@ -1226,12 +1347,16 @@ std::shared_ptr<StlExpr> StlParser::primary()
+ 
+   if (match({StlTokenType::leftParen}))
+   {
++    const TextSpan openSpan = tokenSpan(previous());
+     auto expr = expression();
+-    std::ignore = consume(StlTokenType::rightParen, {"expecting ')' after expression."});
+-    return std::make_shared<StlExpr>(StlExpr {StlExprVal {StlGroupingExpr {expr}}});
++    std::ignore = consume(StlTokenType::rightParen,
++                          {expectedGot("')' to close the parenthesized expression", peek())});
++    const TextSpan closeSpan = tokenSpan(previous());
++    return makeExpr(StlGroupingExpr {expr}, mergeSpans(openSpan, closeSpan));
+   }
+ 
+-  throw error(peek(), "Expecting primary expression");
++  throw error(peek(),
++              expectedGot("an expression here (a number, string, identifier, or '(')", peek()));
+ }
+ 
+ std::shared_ptr<StlExpr> StlParser::variable()
+@@ -1240,17 +1365,23 @@ std::shared_ptr<StlExpr> StlParser::variable()
+ 
+   StlVariableExpr expr = {};
+ 
+-  expr.path.push_back(consume(StlTokenType::identifier, {"Expecting identifier for variable name"}));
++  expr.path.push_back(
++    consume(StlTokenType::identifier, {expectedGot("an identifier to start a variable path", peek())}));
+   expr.name.append(expr.path.back().lexeme);
++  const TextSpan startSpan = tokenSpan(expr.path.back());
++  TextSpan endSpan = startSpan;
+ 
+   while (match({StlTokenType::dot}))
+   {
+-    expr.path.push_back(consume(StlTokenType::identifier, {"Expecting identifier for variable name"}));
++    expr.path.push_back(consume(StlTokenType::identifier,
++                                {expectedGot("an identifier after '" + expr.name + ".' to continue the variable path",
++                                             peek())}));
+     expr.name.append(".");
+     expr.name.append(expr.path.back().lexeme);
++    endSpan = tokenSpan(expr.path.back());
+   }
+ 
+-  return std::make_shared<StlExpr>(StlExpr {StlExprVal {expr}});
++  return makeExpr(std::move(expr), mergeSpans(startSpan, endSpan));
+ }
+ 
+ bool StlParser::match(const std::vector<StlTokenType>& types)
+@@ -1319,9 +1450,21 @@ const StlToken& StlParser::consume(StlTokenType type, const std::vector<std::str
+   throw error(peek(), err);
+ }
+ 
+-StlParser::ParseError StlParser::error(const StlToken& token, const std::string& message) const
++StlParser::ParseError StlParser::error(const StlToken& token, const std::string& message)
+ {
+-  ErrorReporter::report(token.loc, message, token.lexeme.size());
++  if (tolerant_)
++  {
++    TextSpan span = tokenSpan(token);
++    if (span.end <= span.begin)
++    {
++      span.end = span.begin + 1U;
++    }
++    diagnostics_.push_back(Diagnostic {span, Severity::error, DiagnosticCode::parseSyntax, message});
++  }
++  else
++  {
++    ErrorReporter::report(token.loc, message, token.lexeme.size());
++  }
+   return ParseError(message);
+ }
+ 
+diff --git a/libs/core/src/lang/stl_scanner.cpp b/libs/core/src/lang/stl_scanner.cpp
+index 0343ef2..4be9f13 100644
+--- a/libs/core/src/lang/stl_scanner.cpp
++++ b/libs/core/src/lang/stl_scanner.cpp
+@@ -36,11 +36,15 @@ namespace
+ 
+ }  // namespace
+ 
+-StlScanner::StlScanner(const std::string& program): program_(program), current_({program.c_str(), 0U}) {}
++StlScanner::StlScanner(const std::string& program, ScanMode mode)
++  : program_(program), mode_(mode), current_({program.c_str(), 0U})
++{
++}
+ 
+ const StlTokenList& StlScanner::scanTokens()
+ {
+   tokens_.clear();
++  diagnostics_.clear();
+ 
+   while (!isAtEnd())
+   {
+@@ -216,7 +220,24 @@ void StlScanner::scanToken()
+       }
+       else
+       {
+-        error("unexpected character");
++        const auto lexeme = program_.substr(start_, current_.offset - start_);
++        std::string msg;
++        msg.append("Unexpected character '");
++        msg.append(lexeme);
++        msg.append("' (not a valid token in the Sen query language)");
++
++        if (mode_ == ScanMode::tolerant)
++        {
++          tokens_.emplace_back(StlTokenType::invalidChar, lexeme, Var {}, current_);
++          diagnostics_.push_back(Diagnostic {TextSpan {start_, current_.offset},
++                                             Severity::error,
++                                             DiagnosticCode::scanInvalidChar,
++                                             msg});
++        }
++        else
++        {
++          error(msg);
++        }
+       }
+     }
+     break;
+@@ -300,7 +321,13 @@ void StlScanner::addToken(StlTokenType type, const Var& value)
+   tokens_.emplace_back(type, lexeme->second, value, current_);
+ }
+ 
+-void StlScanner::error(const std::string& message) const { ErrorReporter::report({}, message); }
++void StlScanner::error(const std::string& message)
++{
++  // Pass the scanner's current location so the reporter can annotate the offending character in
++  // the source excerpt (otherwise loc.src would be nullptr).
++  const std::size_t width = (current_.offset > start_) ? (current_.offset - start_) : 1U;
++  ErrorReporter::report(current_, message, width);
++}
+ 
+ bool StlScanner::match(char expected)
+ {
+@@ -347,7 +374,23 @@ void StlScanner::string(char endingChar)
+ 
+   if (isAtEnd())
+   {
+-    error("Unterminated string.");
++    std::string msg;
++    msg.append("Unterminated string literal: expected closing ");
++    msg.push_back(endingChar);
++    msg.append(" before end of input");
++
++    if (mode_ == ScanMode::tolerant)
++    {
++      // emit whatever was between the opening quote and EOF so tools can highlight it
++      const auto lexeme = program_.substr(start_ + 1U, current_.offset - start_ - 1U);
++      tokens_.emplace_back(StlTokenType::partialString, lexeme, lexeme, current_);
++      diagnostics_.push_back(Diagnostic {TextSpan {start_, current_.offset},
++                                         Severity::error,
++                                         DiagnosticCode::scanUnterminatedString,
++                                         msg});
++      return;
++    }
++    error(msg);
+     return;
+   }
+ 
+diff --git a/libs/core/src/lang/stl_token.cpp b/libs/core/src/lang/stl_token.cpp
+index 2f08758..9110a31 100644
+--- a/libs/core/src/lang/stl_token.cpp
++++ b/libs/core/src/lang/stl_token.cpp
+@@ -136,6 +136,10 @@ std::string toString(const StlToken& token)
+       return std::string("comment('") + token.lexeme + "')";
+     case StlTokenType::endOfFile:
+       return "endOfFile";
++    case StlTokenType::invalidChar:
++      return std::string("invalidChar('") + token.lexeme + "')";
++    case StlTokenType::partialString:
++      return std::string("partialString('") + token.lexeme + "')";
+   }
+ 
+   return {};
+diff --git a/libs/core/src/obj/interest.cpp b/libs/core/src/obj/interest.cpp
+index 7a005ca..0ab7b02 100644
+--- a/libs/core/src/obj/interest.cpp
++++ b/libs/core/src/obj/interest.cpp
+@@ -205,10 +205,7 @@ Interest::Interest(std::string_view query, const CustomTypeRegistry& typeRegistr
+     throwRuntimeError(compileResult.getError().what);
+   }
+ 
+-  if (!statement.bus.session.lexeme.empty())
+-  {
+-    busCondition_ = BusSpec {statement.bus.session.lexeme, statement.bus.bus.lexeme};
+-  }
++  busCondition_ = BusSpec {statement.bus.session.lexeme, statement.bus.bus.lexeme};
+ 
+   code_ = std::move(compileResult).getValue();
+ }
+diff --git a/libs/core/test/base/assert_test.cpp b/libs/core/test/base/assert_test.cpp
+index 2da1dfa..8a2dfb4 100644
+--- a/libs/core/test/base/assert_test.cpp
++++ b/libs/core/test/base/assert_test.cpp
+@@ -17,6 +17,7 @@
+ 
+ // std
+ #include <cstddef>
++#include <tuple>
+ 
+ using sen::impl::CheckInfo;
+ using sen::impl::CheckType;
+@@ -50,12 +51,12 @@ class AssertTest: public ::testing::Test
+ protected:
+   void SetUp() override
+   {
+-    auto oldHandler = setFailedCheckHandler(testAssertHandler);
++    oldHandler = setFailedCheckHandler(testAssertHandler);
+     ASSERT_NE(oldHandler, nullptr);
+     prevCallCount = callCount;
+   }
+ 
+-  void TearDown() override { oldHandler = setFailedCheckHandler(testAssertHandler); }
++  void TearDown() override { std::ignore = setFailedCheckHandler(oldHandler); }
+ 
+   FailedCheckHandler oldHandler;   // NOLINT(misc-non-private-member-variables-in-classes)
+   std::size_t prevCallCount = 0U;  // NOLINT(misc-non-private-member-variables-in-classes)
+diff --git a/libs/core/test/base/static_vector_test.cpp b/libs/core/test/base/static_vector_test.cpp
+index 672c85c..839c597 100644
+--- a/libs/core/test/base/static_vector_test.cpp
++++ b/libs/core/test/base/static_vector_test.cpp
+@@ -52,7 +52,7 @@ void checkTermination(std::function<void()> func)
+ 
+   EXPECT_EQ(callCount, prevCallCount + 1);
+ 
+-  oldHandler = sen::impl::setFailedCheckHandler(testAssertHandler);
++  std::ignore = sen::impl::setFailedCheckHandler(oldHandler);
+ }
+ 
+ template <typename V, std::size_t size>
+diff --git a/libs/core/test/lang/parser_test.cpp b/libs/core/test/lang/parser_test.cpp
+index 1ca0d28..6de5e9f 100644
+--- a/libs/core/test/lang/parser_test.cpp
++++ b/libs/core/test/lang/parser_test.cpp
+@@ -498,3 +498,324 @@ class Person
+     EXPECT_ANY_THROW(auto statements = parser.parse());
+   }
+ }
++
++// -- stage 1 editor-services foundation -------------------------------------------------------------------------------
++
++/// @test
++/// Every expression node carries a span that covers its source range.
++TEST(Parser, querySpansCoverSource)
++{
++  std::string program = R"(SELECT rpr.Aircraft FROM se.env WHERE lat >= 13)";
++  StlScanner scanner(program);
++  auto tokens = scanner.scanTokens();
++
++  StlParser parser(tokens);
++  auto query = parser.parseQuery();
++
++  ASSERT_TRUE(query.type.has_value());
++  EXPECT_EQ(program.substr(query.type->span.begin, query.type->span.end - query.type->span.begin), "rpr.Aircraft");
++  EXPECT_EQ(program.substr(query.bus.span.begin, query.bus.span.end - query.bus.span.begin), "se.env");
++  ASSERT_TRUE(query.condition);
++  EXPECT_EQ(program.substr(query.condition->span.begin, query.condition->span.end - query.condition->span.begin),
++            "lat >= 13");
++  EXPECT_GE(query.span.end, query.condition->span.end);
++}
++
++/// @test
++/// FROM no longer accepts a '*' wildcard; it must name session.bus.
++TEST(Parser, fromRequiresSessionAndBus)
++{
++  std::string program = R"(SELECT rpr.Aircraft FROM *)";
++  StlScanner scanner(program);
++  auto tokens = scanner.scanTokens();
++
++  StlParser parser(tokens);
++  EXPECT_ANY_THROW(std::ignore = parser.parseQuery());
++}
++
++/// @test
++/// Comparison operators do not chain: `a = b = c` must be written with AND.
++TEST(Parser, equalityDoesNotChain)
++{
++  std::string program = R"(SELECT rpr.Aircraft FROM se.env WHERE a = b = c)";
++  StlScanner scanner(program);
++  auto tokens = scanner.scanTokens();
++
++  StlParser parser(tokens);
++  EXPECT_ANY_THROW(std::ignore = parser.parseQuery());
++}
++
++/// @test
++/// Relational comparisons do not chain either.
++TEST(Parser, comparisonDoesNotChain)
++{
++  std::string program = R"(SELECT rpr.Aircraft FROM se.env WHERE a < b < c)";
++  StlScanner scanner(program);
++  auto tokens = scanner.scanTokens();
++
++  StlParser parser(tokens);
++  EXPECT_ANY_THROW(std::ignore = parser.parseQuery());
++}
++
++/// @test
++/// Tolerant scanner emits an invalidChar token instead of silently dropping characters.
++TEST(Scanner, tolerantEmitsInvalidChar)
++{
++  using sen::lang::ScanMode;
++  using sen::lang::StlTokenType;
++
++  std::string program = "SELECT a FROM x.y WHERE a # 1";
++  StlScanner scanner(program, ScanMode::tolerant);
++  auto tokens = scanner.scanTokens();
++
++  bool sawInvalid = false;
++  for (const auto& tok: tokens)
++  {
++    if (tok.type == StlTokenType::invalidChar)
++    {
++      sawInvalid = true;
++      EXPECT_EQ(tok.lexeme, "#");
++    }
++  }
++  EXPECT_TRUE(sawInvalid);
++  EXPECT_FALSE(scanner.diagnostics().empty());
++}
++
++/// @test
++/// Tolerant scanner produces a partialString for an unterminated literal.
++TEST(Scanner, tolerantEmitsPartialString)
++{
++  using sen::lang::ScanMode;
++  using sen::lang::StlTokenType;
++
++  std::string program = R"(SELECT a FROM x.y WHERE name = "never closed)";
++  StlScanner scanner(program, ScanMode::tolerant);
++  auto tokens = scanner.scanTokens();
++
++  bool sawPartial = false;
++  for (const auto& tok: tokens)
++  {
++    if (tok.type == StlTokenType::partialString)
++    {
++      sawPartial = true;
++    }
++  }
++  EXPECT_TRUE(sawPartial);
++  EXPECT_FALSE(scanner.diagnostics().empty());
++}
++
++/// @test
++/// Tolerant parser records a diagnostic and still returns on malformed input.
++TEST(Parser, tolerantParseRecordsDiagnostic)
++{
++  std::string program = "SELECT FROM se.env WHERE 1 = 1";
++  StlScanner scanner(program);
++  auto tokens = scanner.scanTokens();
++
++  StlParser parser(tokens);
++  auto result = parser.parseQueryTolerant();
++
++  EXPECT_FALSE(result.diagnostics.empty());
++}
++
++// Helper to extract the source substring covered by an expression's span.
++namespace
++{
++std::string sliceBySpan(const std::string& program, const sen::lang::TextSpan& span)
++{
++  if (span.end <= span.begin || span.end > program.size())
++  {
++    return {};
++  }
++  return program.substr(span.begin, span.end - span.begin);
++}
++}  // namespace
++
++/// @test
++/// Parenthesized expressions carry a span that covers '(' through ')'.
++TEST(Parser, groupingSpanIncludesParens)
++{
++  std::string program = R"(SELECT rpr.A FROM se.env WHERE (a + 1) > 0)";
++  StlScanner scanner(program);
++  auto tokens = scanner.scanTokens();
++  StlParser parser(tokens);
++  auto query = parser.parseQuery();
++
++  ASSERT_TRUE(query.condition);
++  using sen::lang::StlBinaryExpr;
++  const auto* binary = std::get_if<StlBinaryExpr>(&query.condition->value);
++  ASSERT_NE(binary, nullptr);
++  ASSERT_TRUE(binary->lhs);
++  EXPECT_EQ(sliceBySpan(program, binary->lhs->span), "(a + 1)");
++}
++
++/// @test
++/// Unary operators extend the span to include the operator.
++TEST(Parser, unarySpanIncludesOperator)
++{
++  std::string program = R"(SELECT rpr.A FROM se.env WHERE NOT active)";
++  StlScanner scanner(program);
++  auto tokens = scanner.scanTokens();
++  StlParser parser(tokens);
++  auto query = parser.parseQuery();
++
++  ASSERT_TRUE(query.condition);
++  EXPECT_EQ(sliceBySpan(program, query.condition->span), "NOT active");
++}
++
++/// @test
++/// Dotted variable paths span from the first identifier through the last.
++TEST(Parser, variablePathSpanCoversWholePath)
++{
++  std::string program = R"(SELECT rpr.A FROM se.env WHERE object.pose.position.z > 0)";
++  StlScanner scanner(program);
++  auto tokens = scanner.scanTokens();
++  StlParser parser(tokens);
++  auto query = parser.parseQuery();
++
++  ASSERT_TRUE(query.condition);
++  using sen::lang::StlBinaryExpr;
++  const auto* binary = std::get_if<StlBinaryExpr>(&query.condition->value);
++  ASSERT_NE(binary, nullptr);
++  ASSERT_TRUE(binary->lhs);
++  EXPECT_EQ(sliceBySpan(program, binary->lhs->span), "object.pose.position.z");
++}
++
++/// @test
++/// BETWEEN spans the LHS through the max term.
++TEST(Parser, betweenSpanCoversMinAndMax)
++{
++  std::string program = R"(SELECT rpr.A FROM se.env WHERE lat BETWEEN -10 AND 10)";
++  StlScanner scanner(program);
++  auto tokens = scanner.scanTokens();
++  StlParser parser(tokens);
++  auto query = parser.parseQuery();
++
++  ASSERT_TRUE(query.condition);
++  EXPECT_EQ(sliceBySpan(program, query.condition->span), "lat BETWEEN -10 AND 10");
++}
++
++/// @test
++/// IN spans the LHS through the closing ')'.
++TEST(Parser, inSpanCoversValueList)
++{
++  std::string program = R"(SELECT rpr.A FROM se.env WHERE role IN (1, 2, 3))";
++  StlScanner scanner(program);
++  auto tokens = scanner.scanTokens();
++  StlParser parser(tokens);
++  auto query = parser.parseQuery();
++
++  ASSERT_TRUE(query.condition);
++  EXPECT_EQ(sliceBySpan(program, query.condition->span), "role IN (1, 2, 3)");
++}
++
++/// @test
++/// Logical AND/OR spans cover both operands.
++TEST(Parser, logicalSpanCoversBothOperands)
++{
++  std::string program = R"(SELECT rpr.A FROM se.env WHERE a > 1 AND b < 2)";
++  StlScanner scanner(program);
++  auto tokens = scanner.scanTokens();
++  StlParser parser(tokens);
++  auto query = parser.parseQuery();
++
++  ASSERT_TRUE(query.condition);
++  EXPECT_EQ(sliceBySpan(program, query.condition->span), "a > 1 AND b < 2");
++}
++
++/// @test
++/// Strict parseQuery() still throws on bad input (backward compatibility with pre-stage-1 callers).
++TEST(Parser, strictParseQueryThrowsOnSyntaxError)
++{
++  std::string program = "SELECT rpr.A FROM se.env WHERE";
++  StlScanner scanner(program);
++  auto tokens = scanner.scanTokens();
++  StlParser parser(tokens);
++  EXPECT_ANY_THROW(std::ignore = parser.parseQuery());
++}
++
++/// @test
++/// Tolerant diagnostics carry a non-empty message, a code, and a span that points into the source.
++TEST(Parser, tolerantDiagnosticCarriesCodeAndSpan)
++{
++  using sen::lang::DiagnosticCode;
++  using sen::lang::Severity;
++
++  std::string program = "SELECT FROM se.env WHERE 1 = 1";
++  StlScanner scanner(program);
++  auto tokens = scanner.scanTokens();
++
++  StlParser parser(tokens);
++  auto result = parser.parseQueryTolerant();
++
++  ASSERT_FALSE(result.diagnostics.empty());
++  const auto& diag = result.diagnostics.front();
++  EXPECT_EQ(diag.severity, Severity::error);
++  EXPECT_EQ(diag.code, DiagnosticCode::parseSyntax);
++  EXPECT_FALSE(diag.message.empty());
++  EXPECT_LE(diag.span.begin, diag.span.end);
++  EXPECT_LE(diag.span.end, program.size());
++}
++
++/// @test
++/// Tolerant parser accumulates incoming scanner diagnostics alongside its own.
++TEST(Parser, tolerantParseKeepsScannerDiagnostics)
++{
++  using sen::lang::DiagnosticCode;
++  using sen::lang::ScanMode;
++
++  std::string program = "SELECT a FROM x.y WHERE a # 1";  // '#' triggers a scanner diagnostic
++  StlScanner scanner(program, ScanMode::tolerant);
++  auto tokens = scanner.scanTokens();
++  auto scannerDiags = scanner.diagnostics();
++  ASSERT_FALSE(scannerDiags.empty());
++
++  StlParser parser(tokens);
++  auto result = parser.parseQueryTolerant(std::move(scannerDiags));
++
++  bool sawScanDiag = false;
++  for (const auto& d: result.diagnostics)
++  {
++    if (d.code == DiagnosticCode::scanInvalidChar)
++    {
++      sawScanDiag = true;
++      break;
++    }
++  }
++  EXPECT_TRUE(sawScanDiag);
++}
++
++/// @test
++/// Tolerant parse returns a partial AST: even when it can't finish, what *was* parsed is kept.
++TEST(Parser, tolerantParsePreservesPartialAst)
++{
++  // Valid SELECT + FROM; WHERE is malformed. The type/bus fields should still be populated.
++  std::string program = "SELECT rpr.A FROM se.env WHERE";
++  StlScanner scanner(program);
++  auto tokens = scanner.scanTokens();
++
++  StlParser parser(tokens);
++  auto result = parser.parseQueryTolerant();
++
++  ASSERT_FALSE(result.diagnostics.empty());
++  ASSERT_TRUE(result.query.type.has_value());
++  EXPECT_EQ(result.query.type->qualifiedName, "rpr.A");
++  EXPECT_EQ(result.query.bus.session.lexeme, "se");
++  EXPECT_EQ(result.query.bus.bus.lexeme, "env");
++}
++
++/// @test
++/// Error messages name the offending token so users can locate the mistake.
++TEST(Parser, errorMessageMentionsOffendingToken)
++{
++  std::string program = "SELECT rpr.A FROM se.env WHERE +";
++  StlScanner scanner(program);
++  auto tokens = scanner.scanTokens();
++
++  StlParser parser(tokens);
++  auto result = parser.parseQueryTolerant();
++
++  ASSERT_FALSE(result.diagnostics.empty());
++  const auto& msg = result.diagnostics.front().message;
++  EXPECT_NE(msg.find("'+'"), std::string::npos) << "message was: " << msg;
++}
+-- 
+2.51.0
+

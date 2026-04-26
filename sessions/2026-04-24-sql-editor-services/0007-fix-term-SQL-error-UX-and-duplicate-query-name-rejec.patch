@@ -1,0 +1,521 @@
+From 99d545bb5c8e6ef6d7161682678dc96fd12a26dc Mon Sep 17 00:00:00 2001
+From: Enrique Parodi Spalazzi <enrique.parodi@airbus.com>
+Date: Fri, 24 Apr 2026 00:19:19 +0200
+Subject: [PATCH 07/10] fix[term]: SQL error UX and duplicate query-name
+ rejection
+
+Two polish items on top of the Stage 3 integration:
+
+- Underline the invalid span: query_highlight::buildRuns takes a list
+  of error spans; tokens that overlap one get the error style (red
+  underline) even if their kind is otherwise unstyled.
+- Errors are surfaced only on a submit attempt, not while typing.
+  Showing them live reads as the parser complaining about a
+  half-typed query. The prompt symbol still flips red live as a
+  subtle binary cue, but the underline and inline message wait for
+  ESC-free Enter. Revealing clears automatically the next time the
+  buffer changes.
+- Inline error message: after a blocked submit, the first error
+  diagnostic's message is rendered on a dedicated row under the
+  input (not inline, so long messages do not get clipped on narrow
+  terminals). The grammar hint is suppressed while the error row is
+  visible. Moving the caret into a specific span swaps the message
+  to that span's diagnostic.
+- Reject duplicate query names across all sources: createQuery now
+  walks every open source instead of just the target session.bus,
+  since 'query rm <name>' and the subscription map both key on the
+  short name.
+---
+ components/term/src/app.cpp                   | 121 ++++++++++++++++--
+ components/term/src/object_store.cpp          |  29 ++++-
+ components/term/src/query_highlight.cpp       |  19 ++-
+ components/term/src/query_highlight.h         |  13 +-
+ components/term/src/styles.h                  |   4 +
+ .../term/test/unit/object_store_test.cpp      |  42 ++++--
+ .../term/test/unit/query_highlight_test.cpp   |  27 ++++
+ 7 files changed, 220 insertions(+), 35 deletions(-)
+
+diff --git a/components/term/src/app.cpp b/components/term/src/app.cpp
+index fb9c773..8469379 100644
+--- a/components/term/src/app.cpp
++++ b/components/term/src/app.cpp
+@@ -105,6 +105,13 @@ struct App::UiState
+   std::string completionHint;
+   std::string completionHintAction;
+ 
++  // Whether error-severity diagnostics should be surfaced (underlined span + inline message).
++  // Flipped on by a submit attempt with errors, off automatically the next time the buffer
++  // content changes (snapshot comparison below) so the feedback doesn't nag the user while
++  // they are still typing.
++  bool        revealErrors = false;
++  std::string revealedBuffer;
++
+   void clearCompletion()
+   {
+     completionCandidates.clear();
+@@ -513,20 +520,34 @@ ftxui::Component App::createInputComponent()
+         const auto& promptStr = ui_->inputPane.getPrompt();
+         auto promptPathDeco = styles::promptPath();
+ 
+-        // Flip the prompt symbol to the error color when the SQL carries at least one
+-        // error-severity diagnostic. Infos (unknown class/session/bus) don't count — those
+-        // self-clear once the registry or bus lookup catches up and shouldn't scream at
+-        // the user while they're still opening a session.
++        // Reveal-errors state auto-clears the moment the user edits the buffer, so the
++        // in-line error feedback only persists until the user starts fixing it.
++        if (ui_->revealErrors && buf != ui_->revealedBuffer)
++        {
++          ui_->revealErrors = false;
++        }
++
++        // Validate once; reuse for (a) the prompt-error flag, (b) the red underline under
++        // the problematic span in the SQL highlight, and (c) the inline error message shown
++        // when the cursor lands inside one of those spans. Only (a) is shown live: (b) and
++        // (c) would read as the parser "complaining" about a half-typed query, so they stay
++        // dark until the user presses Enter (`ui_->revealErrors`). Infos (unknown class /
++        // session / bus) don't participate in any of the three: they self-clear once the
++        // registry or bus lookup catches up.
+         auto promptSymbolDeco = styles::promptSymbol();
++        std::vector<sen::lang::Diagnostic> errorDiags;
+         if (completer_ != nullptr)
+         {
+-          const auto diags = completer_->validateQuery(buf);
+-          for (const auto& d: diags)
++          auto diags = completer_->validateQuery(buf);
++          for (auto& d: diags)
+           {
+             if (d.severity == sen::lang::Severity::error)
+             {
+               promptSymbolDeco = styles::promptSymbolError();
+-              break;
++              if (ui_->revealErrors)
++              {
++                errorDiags.push_back(std::move(d));
++              }
+             }
+           }
+         }
+@@ -548,21 +569,54 @@ ftxui::Component App::createInputComponent()
+           bool isFirst;  // first visual line (has the prompt)
+         };
+ 
+-        // Precompute syntax-highlight runs and a grammar guidance hint for any SQL region in
+-        // the buffer. `runs` and `guidanceHint` are empty when the input is not a
+-        // `query <name> <SQL>` form.
++        // Precompute syntax-highlight runs, a grammar guidance hint, and an optional error
++        // hint for any SQL region in the buffer. All three are empty when the input is not
++        // a `query <name> <SQL>` form.
+         std::vector<highlight::Run> runs;
+         std::string                 guidanceHint;
++        std::string                 errorHint;
+         if (const auto region = highlight::findSqlRegion(buf); region.has_value())
+         {
+           const std::size_t sqlStart = region->first;
+           const auto        sqlText  = std::string_view(buf).substr(sqlStart);
+-          runs = highlight::buildRuns(sqlText, sqlStart);
++
++          // Re-project diagnostic spans from absolute buffer coords into SQL-local coords
++          // so the highlighter can match them against tokens of `sqlText`. Spans that fall
++          // entirely outside the SQL region (shouldn't happen in practice) are dropped.
++          std::vector<sen::lang::TextSpan> errorSpans;
++          errorSpans.reserve(errorDiags.size());
++          for (const auto& d: errorDiags)
++          {
++            if (d.span.end <= sqlStart) { continue; }
++            const auto begin = d.span.begin >= sqlStart ? d.span.begin - sqlStart : 0U;
++            const auto end   = d.span.end   >  sqlStart ? d.span.end   - sqlStart : 0U;
++            if (end > begin) { errorSpans.push_back({begin, end}); }
++          }
++
++          runs = highlight::buildRuns(sqlText, sqlStart, errorSpans);
+ 
+           const std::size_t absCursor = checkedConversion<std::size_t>(ui_->cursorPos);
+           const std::size_t sqlCursor = (absCursor > sqlStart) ? (absCursor - sqlStart) : 0U;
+           const auto        g = sen::lang::query::guideAt(sqlText, sqlCursor);
+           guidanceHint = std::string(g.hint);
++
++          // Pick the error message to surface as the inline hint. A span-matching
++          // diagnostic wins (the caret is on the bad bit), otherwise fall back to the
++          // first error so submit-attempts with the caret at end-of-buffer still get
++          // feedback. `errorDiags` is only non-empty while `revealErrors` is on, so this
++          // is automatically suppressed during live typing.
++          for (const auto& d: errorDiags)
++          {
++            if (absCursor >= d.span.begin && absCursor <= d.span.end)
++            {
++              errorHint = d.message;
++              break;
++            }
++          }
++          if (errorHint.empty() && !errorDiags.empty())
++          {
++            errorHint = errorDiags.front().message;
++          }
+         }
+ 
+         std::vector<VisualLine> vlines;
+@@ -660,9 +714,12 @@ ftxui::Component App::createInputComponent()
+           }
+ 
+           // Inline ghost hint rendered after the cursor on the last visual line, only when
+-          // there's enough room. The tab-completion action ("⏎args" / "⏎run") takes priority;
+-          // otherwise fall back to the grammar guidance hint (e.g. "expected `FROM`") so the
+-          // user sees what the parser expects next without having to hit Tab.
++          // there's enough room. Priority order:
++          //   1. tab-completion action ("⏎args" / "⏎run") — user has a pending choice.
++          //   2. grammar hint (e.g. "`FROM`") — the parser's expected next token.
++          // Error messages are intentionally not in this chain: they are typically too
++          // long to fit after the query and get their own row below the input (see the
++          // dedicated error row appended after this loop).
+           bool isLastLine = (i == checkedConversion<int>(vlines.size()) - 1);
+           if (isLastLine && focused)
+           {
+@@ -679,6 +736,12 @@ ftxui::Component App::createInputComponent()
+               ghost = std::string("  ") + unicode::returnSymbol + ui_->completionHintAction;
+               ghostCells = 3 + checkedConversion<int>(ui_->completionHintAction.size());
+             }
++            else if (!errorHint.empty())
++            {
++              // When there's an error, suppress the grammar hint (it no longer applies)
++              // but leave the inline slot empty so the user's eye moves to the dedicated
++              // error row below.
++            }
+             else if (!guidanceHint.empty())
+             {
+               // Guidance strings from sen::lang::query::guideAt are ASCII, so bytes == cells.
+@@ -695,6 +758,15 @@ ftxui::Component App::createInputComponent()
+           rows.push_back(ftxui::hbox(std::move(parts)));
+         }
+ 
++        // Dedicated error row: rendered below the input whenever `errorHint` is set (i.e.,
++        // after a blocked submit on an invalid query). Gets its own line so the message
++        // is always visible, regardless of how long the query already is.
++        if (!errorHint.empty())
++        {
++          rows.push_back(ftxui::hbox({ftxui::text("  "),
++                                      ftxui::text(errorHint) | styles::errorMessage()}));
++        }
++
+         return ftxui::vbox(std::move(rows));
+       }),
+     [this](const ftxui::Event& event) -> bool
+@@ -703,6 +775,27 @@ ftxui::Component App::createInputComponent()
+ 
+       if (event == ftxui::Event::Return)
+       {
++        // Refuse to submit a query that has any error-severity diagnostic. Flip the
++        // reveal-errors flag on instead so the underline + inline message become visible;
++        // the render pass will flip it back off the moment the user edits the buffer.
++        const bool hasErrors = [&]()
++        {
++          if (completer_ == nullptr) { return false; }
++          const auto diags = completer_->validateQuery(buf);
++          for (const auto& d: diags)
++          {
++            if (d.severity == sen::lang::Severity::error) { return true; }
++          }
++          return false;
++        }();
++        if (hasErrors)
++        {
++          ui_->revealErrors = true;
++          ui_->revealedBuffer = buf;
++          requestRedraw();
++          return true;
++        }
++        ui_->revealErrors = false;
+         ui_->cursorPos = 0;
+         ui_->commandPane.scrollToBottom();
+         ui_->inputPane.submit();
+diff --git a/components/term/src/object_store.cpp b/components/term/src/object_store.cpp
+index caf295e..9890cc3 100644
+--- a/components/term/src/object_store.cpp
++++ b/components/term/src/object_store.cpp
+@@ -324,16 +324,37 @@ Result<void, std::string> ObjectStore::createQuery(std::string_view name, std::s
+   }
+ 
+   const auto& busCondition = interest->getBusCondition().value();
++
++  // Query names live in a single flat namespace across all sources: `query rm <name>`
++  // takes a short name, and `querySubscriptions_` is keyed by short name too. Reject
++  // duplicates anywhere, not just on the target session.bus.
++  for (const auto& [busId, otherSource]: openSources_)
++  {
++    for (const auto& [existingName, existingData]: otherSource.providers)
++    {
++      const auto dotPos = existingName.rfind('.');
++      if (dotPos == std::string::npos)
++      {
++        continue;
++      }
++      const auto shortName = existingName.substr(dotPos + 1);
++      if (shortName == "all")
++      {
++        continue;
++      }
++      if (shortName == nameStr)
++      {
++        return Err("query '" + nameStr + "' already exists on " + busId);
++      }
++    }
++  }
++
+   auto& sourceData = getOrOpenSource(busCondition.sessionName, busCondition.busName);
+ 
+   std::string providerId = busCondition.sessionName + "." + busCondition.busName + "." + nameStr;
+ 
+   for (const auto& [existingName, existingData]: sourceData.providers)
+   {
+-    if (existingName == providerId)
+-    {
+-      return Err("query '" + nameStr + "' already exists");
+-    }
+     // Skip the internal ".all" provider when checking for duplicate selections.
+     if (existingName.size() >= 4 && existingName.compare(existingName.size() - 4, 4, ".all") == 0)
+     {
+diff --git a/components/term/src/query_highlight.cpp b/components/term/src/query_highlight.cpp
+index 2884a66..65396d8 100644
+--- a/components/term/src/query_highlight.cpp
++++ b/components/term/src/query_highlight.cpp
+@@ -100,15 +100,28 @@ std::optional<std::pair<std::size_t, std::size_t>> findSqlRegion(std::string_vie
+   return std::make_pair(i, buffer.size());
+ }
+ 
+-std::vector<Run> buildRuns(std::string_view sql, std::size_t baseOffset)
++std::vector<Run> buildRuns(std::string_view sql,
++                            std::size_t baseOffset,
++                            const std::vector<sen::lang::TextSpan>& errorSpans)
+ {
++  const auto overlapsError = [&](const sen::lang::TextSpan& s) -> bool
++  {
++    for (const auto& es: errorSpans)
++    {
++      if (s.begin < es.end && es.begin < s.end) { return true; }
++    }
++    return false;
++  };
++
+   std::vector<Run> runs;
+   const auto tokens = sen::lang::query::tokenize(sql);
+   runs.reserve(tokens.tokens.size());
+   for (const auto& t: tokens.tokens)
+   {
+-    if (!kindIsStyled(t.kind)) { continue; }
+-    runs.push_back({baseOffset + t.span.begin, baseOffset + t.span.end, decoratorFor(t.kind)});
++    const bool isError = overlapsError(t.span);
++    if (!kindIsStyled(t.kind) && !isError) { continue; }
++    const auto deco = isError ? styles::queryError() : decoratorFor(t.kind);
++    runs.push_back({baseOffset + t.span.begin, baseOffset + t.span.end, deco});
+   }
+   return runs;
+ }
+diff --git a/components/term/src/query_highlight.h b/components/term/src/query_highlight.h
+index fe26835..7e4cf06 100644
+--- a/components/term/src/query_highlight.h
++++ b/components/term/src/query_highlight.h
+@@ -8,6 +8,9 @@
+ #ifndef SEN_COMPONENTS_TERM_SRC_QUERY_HIGHLIGHT_H
+ #define SEN_COMPONENTS_TERM_SRC_QUERY_HIGHLIGHT_H
+ 
++// sen
++#include "sen/core/lang/code_location.h"
++
+ // ftxui
+ #include <ftxui/dom/elements.hpp>
+ 
+@@ -39,8 +42,14 @@ struct Run
+ 
+ /// Tokenize `sql` and produce a list of styled runs. Offsets in the result are shifted
+ /// by `baseOffset` so callers working with a larger buffer can look them up directly.
+-/// Unstyled token kinds (identifiers, operators, punctuation) produce no runs.
+-[[nodiscard]] std::vector<Run> buildRuns(std::string_view sql, std::size_t baseOffset = 0U);
++/// Unstyled token kinds (identifiers, operators, punctuation) produce no runs unless
++/// they overlap one of the `errorSpans`; in that case the token carries the error
++/// style (red underline) so diagnostic positions show through the syntax highlight.
++/// `errorSpans` are expected in the same coordinate system as `sql` (i.e., 0-based
++/// into `sql`, not shifted by `baseOffset`).
++[[nodiscard]] std::vector<Run> buildRuns(std::string_view sql,
++                                         std::size_t baseOffset = 0U,
++                                         const std::vector<sen::lang::TextSpan>& errorSpans = {});
+ 
+ /// Return the first run containing `offset`, or `nullptr` if none. Used by the input-pane
+ /// renderer to re-apply the run's decorator on top of the cursor's inverted style.
+diff --git a/components/term/src/styles.h b/components/term/src/styles.h
+index 5b7b2e3..04a0ac0 100644
+--- a/components/term/src/styles.h
++++ b/components/term/src/styles.h
+@@ -69,6 +69,10 @@ inline ftxui::Decorator descriptionText() { return ftxui::color(activeTheme().tr
+ 
+ inline ftxui::Decorator errorTitle()   { return ftxui::bold | ftxui::color(activeTheme().error); }
+ inline ftxui::Decorator errorMessage() { return ftxui::color(activeTheme().error); }
++/// Underline + error color for the span of a diagnostic inside a SQL query. Meant to be
++/// layered on top of the syntax-highlight color, but emitted as a standalone run today
++/// since the renderer does not compose overlapping run decorators.
++inline ftxui::Decorator queryError()   { return ftxui::underlined | ftxui::color(activeTheme().error); }
+ 
+ // Status bar styles.
+ 
+diff --git a/components/term/test/unit/object_store_test.cpp b/components/term/test/unit/object_store_test.cpp
+index cea8461..c55b0f6 100644
+--- a/components/term/test/unit/object_store_test.cpp
++++ b/components/term/test/unit/object_store_test.cpp
+@@ -67,13 +67,13 @@ protected:
+ // openSource validation
+ //--------------------------------------------------------------------------------------------------------------
+ 
+-TEST_F(ObjectStoreTest, OpenSourceTooManyComponentsFails)
++TEST_F(ObjectStoreTest, openSourceTooManyComponentsFails)
+ {
+   auto result = store_->openSource("a.b.c");
+   EXPECT_TRUE(result.isError());
+ }
+ 
+-TEST_F(ObjectStoreTest, OpenSourceFourComponentsFails)
++TEST_F(ObjectStoreTest, openSourceFourComponentsFails)
+ {
+   auto result = store_->openSource("a.b.c.d");
+   EXPECT_TRUE(result.isError());
+@@ -83,28 +83,28 @@ TEST_F(ObjectStoreTest, OpenSourceFourComponentsFails)
+ // createQuery validation
+ //--------------------------------------------------------------------------------------------------------------
+ 
+-TEST_F(ObjectStoreTest, CreateQueryRejectsNameWithDot)
++TEST_F(ObjectStoreTest, createQueryRejectsNameWithDot)
+ {
+   auto result = store_->createQuery("foo.bar", "SELECT * FROM session.bus");
+   ASSERT_TRUE(result.isError());
+   EXPECT_NE(result.getError().find("dots"), std::string::npos);
+ }
+ 
+-TEST_F(ObjectStoreTest, CreateQueryRejectsNameWithSpace)
++TEST_F(ObjectStoreTest, createQueryRejectsNameWithSpace)
+ {
+   auto result = store_->createQuery("foo bar", "SELECT * FROM session.bus");
+   ASSERT_TRUE(result.isError());
+   EXPECT_NE(result.getError().find("spaces"), std::string::npos);
+ }
+ 
+-TEST_F(ObjectStoreTest, CreateQueryRejectsInvalidSelection)
++TEST_F(ObjectStoreTest, createQueryRejectsInvalidSelection)
+ {
+   auto result = store_->createQuery("q", "this is not a valid SELECT statement");
+   ASSERT_TRUE(result.isError());
+   EXPECT_NE(result.getError().find("invalid query"), std::string::npos);
+ }
+ 
+-TEST_F(ObjectStoreTest, CreateQueryRejectsSelectionWithoutSource)
++TEST_F(ObjectStoreTest, createQueryRejectsSelectionWithoutSource)
+ {
+   // A SELECT with no FROM has no bus condition and should be rejected up-front.
+   auto result = store_->createQuery("q", "SELECT *");
+@@ -114,11 +114,29 @@ TEST_F(ObjectStoreTest, CreateQueryRejectsSelectionWithoutSource)
+               result.getError().find("invalid query") != std::string::npos);
+ }
+ 
++TEST_F(ObjectStoreTest, createQueryRejectsDuplicateNameAcrossBuses)
++{
++  // Query names live in a single flat namespace regardless of source. Creating a second
++  // query with the same short name on a different bus must fail.
++  ASSERT_TRUE(store_->createQuery("q", "SELECT * FROM s1.b1").isOk());
++  auto result = store_->createQuery("q", "SELECT * FROM s2.b2");
++  ASSERT_TRUE(result.isError());
++  EXPECT_NE(result.getError().find("already exists"), std::string::npos);
++}
++
++TEST_F(ObjectStoreTest, createQueryRejectsDuplicateNameSameBus)
++{
++  ASSERT_TRUE(store_->createQuery("q", "SELECT * FROM s1.b1").isOk());
++  auto result = store_->createQuery("q", "SELECT * FROM s1.b1");
++  ASSERT_TRUE(result.isError());
++  EXPECT_NE(result.getError().find("already exists"), std::string::npos);
++}
++
+ //--------------------------------------------------------------------------------------------------------------
+ // removeQuery
+ //--------------------------------------------------------------------------------------------------------------
+ 
+-TEST_F(ObjectStoreTest, RemoveQueryUnknownFails)
++TEST_F(ObjectStoreTest, removeQueryUnknownFails)
+ {
+   auto result = store_->removeQuery("doesNotExist");
+   ASSERT_TRUE(result.isError());
+@@ -129,13 +147,13 @@ TEST_F(ObjectStoreTest, RemoveQueryUnknownFails)
+ // closeSource validation
+ //--------------------------------------------------------------------------------------------------------------
+ 
+-TEST_F(ObjectStoreTest, CloseSourceWithFourComponentsFails)
++TEST_F(ObjectStoreTest, closeSourceWithFourComponentsFails)
+ {
+   auto result = store_->closeSource("a.b.c.d");
+   EXPECT_TRUE(result.isError());
+ }
+ 
+-TEST_F(ObjectStoreTest, CloseQueryOnUnopenedBusFails)
++TEST_F(ObjectStoreTest, closeQueryOnUnopenedBusFails)
+ {
+   // 3 components ⇒ closeSource interprets it as "session.bus.query".
+   // Bus is not open, so this should error with a "not open" hint.
+@@ -148,7 +166,7 @@ TEST_F(ObjectStoreTest, CloseQueryOnUnopenedBusFails)
+ // Read-only state
+ //--------------------------------------------------------------------------------------------------------------
+ 
+-TEST_F(ObjectStoreTest, FreshStoreHasNoObjectsOrSources)
++TEST_F(ObjectStoreTest, freshStoreHasNoObjectsOrSources)
+ {
+   EXPECT_EQ(store_->getObjectCount(), 0U);
+   EXPECT_TRUE(store_->getOpenSources().empty());
+@@ -156,12 +174,12 @@ TEST_F(ObjectStoreTest, FreshStoreHasNoObjectsOrSources)
+   EXPECT_FALSE(store_->isSourceOpen("anything"));
+ }
+ 
+-TEST_F(ObjectStoreTest, FreshStoreGenerationIsZero)
++TEST_F(ObjectStoreTest, freshStoreGenerationIsZero)
+ {
+   EXPECT_EQ(store_->getGeneration(), 0U);
+ }
+ 
+-TEST_F(ObjectStoreTest, DrainNotificationsEmptyOnFreshStore)
++TEST_F(ObjectStoreTest, drainNotificationsEmptyOnFreshStore)
+ {
+   EXPECT_TRUE(store_->drainNotifications().empty());
+ }
+diff --git a/components/term/test/unit/query_highlight_test.cpp b/components/term/test/unit/query_highlight_test.cpp
+index ab62757..bc5efbc 100644
+--- a/components/term/test/unit/query_highlight_test.cpp
++++ b/components/term/test/unit/query_highlight_test.cpp
+@@ -92,5 +92,32 @@ TEST(RunAt, findsRunCoveringOffset)
+   EXPECT_EQ(runAt(runs, 7U), nullptr);  // identifier x is unstyled
+ }
+ 
++TEST(BuildRuns, errorSpanOnIdentifierAddsStyledRun)
++{
++  // A diagnostic spanning an identifier must produce a run covering that identifier
++  // even though plain identifiers are otherwise unstyled.
++  const std::string_view sql = "SELECT x FROM s.b WHERE foo = 1";
++  // Span over "foo" (24..27).
++  const std::vector<sen::lang::TextSpan> errorSpans {{24U, 27U}};
++  const auto runs = buildRuns(sql, 0U, errorSpans);
++  // Baseline: SELECT + FROM + WHERE + 1 = 4 styled runs without errors.
++  // With "foo" underlined, we get a fifth run.
++  ASSERT_EQ(runs.size(), 5U);
++  const auto* errRun = runAt(runs, 25U);
++  ASSERT_NE(errRun, nullptr);
++  EXPECT_EQ(errRun->begin, 24U);
++  EXPECT_EQ(errRun->end,   27U);
++}
++
++TEST(BuildRuns, errorSpanShiftsWithBaseOffset)
++{
++  const std::string_view sql = "foo";
++  const std::vector<sen::lang::TextSpan> errorSpans {{0U, 3U}};
++  const auto runs = buildRuns(sql, 10U, errorSpans);
++  ASSERT_EQ(runs.size(), 1U);
++  EXPECT_EQ(runs[0].begin, 10U);
++  EXPECT_EQ(runs[0].end,   13U);
++}
++
+ }  // namespace
+ }  // namespace sen::components::term::highlight
+-- 
+2.51.0
+
